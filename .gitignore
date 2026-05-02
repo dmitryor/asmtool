@@ -1,0 +1,19 @@
+# Local Claude settings
+.claude/settings.local.json
+
+# Build artifacts
+/jwasm-mcp
+/listcheck
+/probe
+*.exe
+*.test
+*.out
+
+# Project cache (per .jwasm-mcp.toml)
+.jwasm-mcp-cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
