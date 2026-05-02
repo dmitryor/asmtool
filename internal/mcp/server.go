@@ -213,12 +213,24 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 			mcp.Description("Max entries to return (default 200)")),
 	), s.handleScanBlockers)
 
+	srv.AddTool(mcp.NewTool("data_refs_at",
+		mcp.WithDescription("Address-keyed counterpart to find_data_refs. Returns the union of memory-operand/imm/offset/dw/db/dd refs from every symbol whose declared address falls in [addr, addr+size). Closes the alias-overlap case where a byte EQU (e.g. Var_d5c8) lives at the same byte as a word label (VideoDetectResult): writes go through the word alias and don't show up under the byte symbol's refs. Output groups refs by the source symbol they were declared against, with access classification per ref."),
+		mcp.WithString("addr", mcp.Required(),
+			mcp.Description("Start address. Hex (0xa720, A720h) or decimal.")),
+		mcp.WithNumber("size",
+			mcp.Description("Byte range to cover (default 1 -- byte query)")),
+	), s.handleDataRefsAt)
+
 	srv.AddTool(mcp.NewTool("smc_clusters",
-		mcp.WithDescription("Group SMC anchors that sit close together in CSEG into clusters -- typically the runs of 2-3 consecutive immediates a single writer PROC patches at once. Two anchors are placed in the same cluster when they share a source file and their CSEG addresses are within `max_gap` bytes of each other (default 16). Each cluster surfaces its members (anchor, var alias, slot info, host instruction) plus the distinct PROCs that write to any var in it -- the natural unit of SMC analysis when annotating a 100+-var backlog. Use this BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
+		mcp.WithDescription("Group SMC anchors into clusters. Two grouping modes:\n  - by=\"proximity\" (default): anchors that share a source file AND lie within `max_gap` bytes of each other (default 16). Catches runs of 2-3 consecutive immediates patched together.\n  - by=\"writer_proc\" / \"reader_proc\": vars touched by the same PROC. Catches matrix-broadcast patterns where a single PROC reads or writes 4+ slots back-to-back even when they span ~150 source lines.\nEach cluster surfaces its members (anchor, var alias, slot info, host instruction). Proximity clusters also list the writer PROCs that touch any var in the cluster. Use proc-keyed clustering BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
+		mcp.WithString("by",
+			mcp.Description("Cluster key: 'proximity' (default), 'writer_proc', or 'reader_proc'")),
+		mcp.WithString("proc",
+			mcp.Description("With by=writer_proc/reader_proc: filter to one PROC")),
 		mcp.WithString("file",
-			mcp.Description("Optional: limit scan to a single source file (basename or absolute path)")),
+			mcp.Description("With by=proximity: limit scan to a single source file (basename or absolute path)")),
 		mcp.WithNumber("max_gap",
-			mcp.Description("Max byte gap between consecutive anchors to keep them in the same cluster (default 16)")),
+			mcp.Description("With by=proximity: max byte gap between consecutive anchors (default 16)")),
 		mcp.WithNumber("min_size",
 			mcp.Description("Minimum cluster size -- singletons are usually noise (default 2)")),
 		mcp.WithNumber("limit",
@@ -363,26 +375,70 @@ func (s *Server) handleFindDataRefs(ctx context.Context, req mcp.CallToolRequest
 	if len(byAccess) > 0 {
 		res["by_access"] = byAccess
 	}
-	// SMC anchor case: when the queried name is a label-only export with no
-	// memory-operand uses, the writes typically go through Var_NNNN EQUates
-	// of the form `byte ptr <Anchor> + N`. Surface those aliases so the
-	// caller can re-query without grepping.
+	// Alias surface. Two flavours:
+	//
+	//   1. EQU-style aliases pointing at this name as their SMC anchor
+	//      (e.g. SmcAnchor_a71f -> Var_a720). Always surfaced regardless
+	//      of ref count -- multi-var anchors carry useful structure.
+	//
+	//   2. Same-address aliases: any other symbol declared at the same
+	//      byte address as the queried one. This catches the byte-EQU /
+	//      word-label overlap (Var_d5c8 vs VideoDetectResult) where the
+	//      writes go through the wider symbol and don't surface under
+	//      the narrower one. Surfaced only when the narrower name has
+	//      ref_count == 0 and the wider sibling has refs of its own --
+	//      we don't want to noise up every query that happens to share
+	//      an address.
+	aliasList := make([]map[string]any, 0)
+	for _, a := range idx.FindEquAliasesOf(name) {
+		slot, _ := index.ParseSmcEqu(a.Text)
+		aliasList = append(aliasList, map[string]any{
+			"name":   a.Name,
+			"kind":   "smc_var",
+			"file":   filepath.Base(a.File),
+			"line":   a.Line,
+			"size":   slot.Size,
+			"offset": slot.Offset,
+			"text":   a.Text,
+		})
+	}
+	// Same-address aliases (strict equality on the queried name's address).
 	if len(out) == 0 {
-		if aliases := idx.FindEquAliasesOf(name); len(aliases) > 0 {
-			aliasList := make([]map[string]any, 0, len(aliases))
-			for _, a := range aliases {
-				slot, _ := index.ParseSmcEqu(a.Text)
+		myDecls := idx.FindSymbol(name)
+		var myAddr uint32
+		hasMyAddr := false
+		for _, d := range myDecls {
+			if d.HasAddr {
+				myAddr = d.Addr
+				hasMyAddr = true
+				break
+			}
+		}
+		if hasMyAddr {
+			for _, sib := range idx.SymbolsCoveringRange(myAddr, myAddr+1) {
+				if sib.Name == name {
+					continue
+				}
+				sibRefs := idx.FindDataRefs(sib.Name)
+				if len(sibRefs) == 0 {
+					continue
+				}
 				aliasList = append(aliasList, map[string]any{
-					"name":   a.Name,
-					"file":   filepath.Base(a.File),
-					"line":   a.Line,
-					"size":   slot.Size,
-					"offset": slot.Offset,
-					"text":   a.Text,
+					"name":      sib.Name,
+					"kind":      "same_addr",
+					"file":      filepath.Base(sib.File),
+					"line":      sib.Line,
+					"addr":      fmt.Sprintf("0x%04x", sib.Addr),
+					"sym_kind":  sib.Kind,
+					"ref_count": len(sibRefs),
 				})
 			}
-			res["aliases"] = aliasList
-			res["note"] = "no direct refs -- this looks like an SMC anchor exported as a label only; writes/reads go through the EQU'd Var_* aliases listed under `aliases`. Try smc_var_info(<alias>) or find_data_refs(<alias>) for the full picture."
+		}
+	}
+	if len(aliasList) > 0 {
+		res["aliases"] = aliasList
+		if len(out) == 0 {
+			res["note"] = "no direct refs against this name -- writes/reads likely go through the listed aliases. Try smc_var_info(<alias>), find_data_refs(<alias>), or data_refs_at(<addr>, <size>) to union them."
 		}
 	}
 	return jsonText(res), nil
@@ -862,10 +918,78 @@ func (s *Server) handleScanBlockers(ctx context.Context, req mcp.CallToolRequest
 	}), nil
 }
 
-// handleSmcClusters returns SMC anchors grouped by spatial proximity --
-// the high-level view of "which anchors are written together by one PROC."
-// See Index.SmcClusters for the grouping heuristic.
+// handleDataRefsAt unions data refs from every symbol whose address
+// falls inside [addr, addr+size). Resolves the byte-slot-inside-word case
+// where a write to the wide alias is invisible under the narrow alias.
+func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	addrStr, err := req.RequireString("addr")
+	if err != nil {
+		return errResult("missing 'addr': " + err.Error()), nil
+	}
+	addr, err := parseAddrArg(addrStr)
+	if err != nil {
+		return errResult(err.Error()), nil
+	}
+	size := uint32(req.GetFloat("size", 1))
+	if size == 0 {
+		size = 1
+	}
+	idx := s.Index()
+	syms := idx.SymbolsCoveringRange(addr, addr+size)
+	bySym := make([]map[string]any, 0, len(syms))
+	totalRefs := 0
+	totalByAccess := map[string]int{}
+	for _, sym := range syms {
+		refs := idx.FindDataRefs(sym.Name)
+		entries := make([]map[string]any, 0, len(refs))
+		byAccess := map[string]int{}
+		for _, r := range refs {
+			row := map[string]any{
+				"file":    filepath.Base(r.File),
+				"line":    r.Line,
+				"kind":    r.Kind,
+				"in_proc": r.EnclosingProc,
+				"text":    r.Text,
+			}
+			if a := index.ClassifyAccess(r); a != "" {
+				row["access"] = a
+				byAccess[a]++
+				totalByAccess[a]++
+			}
+			entries = append(entries, row)
+		}
+		bySym = append(bySym, map[string]any{
+			"symbol":    sym.Name,
+			"kind":      sym.Kind,
+			"addr":      fmt.Sprintf("0x%04x", sym.Addr),
+			"file":      filepath.Base(sym.File),
+			"line":      sym.Line,
+			"ref_count": len(entries),
+			"by_access": byAccess,
+			"refs":      entries,
+		})
+		totalRefs += len(entries)
+	}
+	res := map[string]any{
+		"addr":       fmt.Sprintf("0x%04x", addr),
+		"size":       size,
+		"sym_count":  len(syms),
+		"ref_count":  totalRefs,
+		"by_access":  totalByAccess,
+		"symbols":    bySym,
+	}
+	if len(syms) == 0 {
+		res["note"] = "no symbols declared in this byte range -- check the addr or pass a wider size"
+	}
+	return jsonText(res), nil
+}
+
+// handleSmcClusters returns SMC anchors grouped either by spatial proximity
+// or by shared writer/reader PROC. See Index.SmcClusters and
+// Index.SmcClustersByProc for the two grouping heuristics.
 func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	by := strings.ToLower(req.GetString("by", "proximity"))
+	procFilter := req.GetString("proc", "")
 	fileFilter := req.GetString("file", "")
 	maxGap := uint32(req.GetFloat("max_gap", 16))
 	if maxGap == 0 {
@@ -880,6 +1004,51 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 		limit = 50
 	}
 	idx := s.Index()
+
+	switch by {
+	case "writer_proc", "reader_proc", "writer", "reader":
+		role := "writer"
+		if by == "reader_proc" || by == "reader" {
+			role = "reader"
+		}
+		procClusters := idx.SmcClustersByProc(by, procFilter, minSize)
+		total := len(procClusters)
+		if len(procClusters) > limit {
+			procClusters = procClusters[:limit]
+		}
+		out := make([]map[string]any, 0, len(procClusters))
+		for _, c := range procClusters {
+			vars := make([]map[string]any, 0, len(c.Vars))
+			for _, v := range c.Vars {
+				row := map[string]any{
+					"var":              v.Var.Name,
+					"anchor":           v.Anchor.Name,
+					"addr":             fmt.Sprintf("0x%04x", v.Anchor.Addr),
+					"line":             v.Anchor.Line,
+					"file":             filepath.Base(v.Anchor.File),
+					"slot":             map[string]any{"size": v.Slot.Size, "offset": v.Slot.Offset},
+					"host_instruction": v.HostInstr,
+				}
+				vars = append(vars, row)
+			}
+			entry := map[string]any{
+				"proc":      c.Proc,
+				"role":      c.Role,
+				"var_count": len(c.Vars),
+				"vars":      vars,
+			}
+			out = append(out, entry)
+		}
+		return jsonText(map[string]any{
+			"by":       by,
+			"role":     role,
+			"total":    total,
+			"shown":    len(out),
+			"min_size": minSize,
+			"clusters": out,
+		}), nil
+	}
+
 	var fileAbs string
 	if fileFilter != "" {
 		fileAbs = s.resolveFile(fileFilter)
@@ -1005,11 +1174,73 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 		anchorEntry["addr"] = fmt.Sprintf("0x%04x", anchor.Addr)
 	}
 	res["anchor_decl"] = anchorEntry
+	// Multi-instruction host walk. When a listing is loaded, walk the
+	// instruction stream from the anchor's address through the byte that
+	// contains the slot. The slot may land inside the *second* or *third*
+	// instruction (Var_d2a7 case: anchor at d2a0, sub is 5 bytes, the +7
+	// slot is in the cmp at d2a5). We surface the whole run so the agent
+	// sees the patched-by-which-instruction without re-reading the source.
+	if anchor.HasAddr {
+		slotAddr := anchor.Addr + uint32(slot.Offset)
+		end := slotAddr + 1
+		switch slot.Size {
+		case "word":
+			end = slotAddr + 2
+		case "dword":
+			end = slotAddr + 4
+		}
+		if instrs := idx.InstructionsCovering(anchor.Addr, end); len(instrs) > 0 {
+			arr := make([]map[string]any, 0, len(instrs))
+			var hostText, hostBytes string
+			var hostAddr uint32
+			var hostSize uint32
+			for _, ins := range instrs {
+				row := map[string]any{
+					"addr":     fmt.Sprintf("0x%04x", ins.Addr),
+					"size":     ins.Size,
+					"encoding": ins.Bytes,
+					"text":     ins.Text,
+				}
+				if slotAddr >= ins.Addr && slotAddr < ins.Addr+ins.Size {
+					row["contains_slot"] = true
+					row["slot_byte_offset_in_instr"] = int(slotAddr - ins.Addr)
+					hostText = ins.Text
+					hostBytes = ins.Bytes
+					hostAddr = ins.Addr
+					hostSize = ins.Size
+				}
+				arr = append(arr, row)
+			}
+			res["host_instructions"] = arr
+			// Backwards-compat singular: prefer the slot-containing one.
+			if hostText != "" {
+				res["host_instruction"] = map[string]any{
+					"addr":     fmt.Sprintf("0x%04x", hostAddr),
+					"size":     hostSize,
+					"encoding": hostBytes,
+					"text":     hostText,
+				}
+			}
+		}
+	}
+	// Source-level fallback (or supplement when the listing isn't loaded):
+	// the anchor's source line. Always set as `host_instruction_source`
+	// so callers that previously read host_instruction.text for *anchor*
+	// (not slot) text still have access to it.
 	if instr := idx.HostInstruction(anchor); instr != "" {
-		res["host_instruction"] = map[string]any{
+		res["host_instruction_source"] = map[string]any{
 			"file": filepath.Base(anchor.File),
 			"line": anchor.Line,
 			"text": instr,
+		}
+		// If the listing wasn't available we never set host_instruction;
+		// fall back to the source line so the field is never missing.
+		if _, ok := res["host_instruction"]; !ok {
+			res["host_instruction"] = map[string]any{
+				"file": filepath.Base(anchor.File),
+				"line": anchor.Line,
+				"text": instr,
+			}
 		}
 	}
 

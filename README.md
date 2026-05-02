@@ -40,6 +40,11 @@ Read-only navigation:
   instruction, and slot info — a single round-trip for the agent's SMC
   worklist.
 - `find_symbol(name)` — every declaration site of a name
+- `data_refs_at(addr, size?)` — address-keyed counterpart to
+  `find_data_refs`. Unions refs from every symbol declared in
+  `[addr, addr+size)`. Closes the byte-EQU / word-label overlap case
+  where writes go through the wider alias and don't surface under the
+  narrow one.
 
 Composite:
 
@@ -47,13 +52,18 @@ Composite:
   callees + sibling PROCs + locals; the goal-2 naming-decision tool
 - `smc_var_info(name)` — SMC slot resolver: takes either a `Var_NNNN` EQU
   alias or its `SmcAnchor_NNNN` host label and returns the typed slot
-  (size + offset), the anchor address, the host instruction, and a
-  writer/reader split (memory-operand refs classified by access).
-- `smc_clusters(file?, max_gap?, min_size?)` — group SMC anchors by
-  spatial proximity in CSEG. Two anchors share a cluster when they're
-  in the same source file and within `max_gap` bytes (default 16). Each
-  cluster surfaces its members + the writer PROCs that touch any var in
-  it — the natural unit when annotating a 100+-var backlog.
+  (size + offset), the anchor address, every instruction from the
+  anchor through the slot byte (with byte encoding and a
+  `contains_slot` marker on the patched one), and a writer/reader
+  split (memory-operand refs classified by access).
+- `smc_clusters(by?, proc?, file?, max_gap?, min_size?)` — group SMC
+  anchors. Two modes:
+  - `by="proximity"` (default): same source file + addr gap ≤
+    `max_gap`. Catches consecutive-immediate runs.
+  - `by="writer_proc"` / `by="reader_proc"`: vars touched by the
+    same PROC. Catches matrix-broadcast patterns (4-8 SMC slots
+    written by one PROC, read by another, even when they span
+    ~150 source lines).
 - `unresolved(kind, limit)` — scaffolding backlog ranked by reference count;
   `kind` ∈ `procs` (default), `data`, `all`
 

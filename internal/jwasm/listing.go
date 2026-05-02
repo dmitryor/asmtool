@@ -58,9 +58,29 @@ type Symbol struct {
 	Length uint32
 }
 
+// Instruction is one assembled instruction row from the listing body.
+// Addr is the CSEG offset of the first emitted byte; Size counts the bytes
+// JWasm emitted for this row; Bytes carries the raw hex pairs (e.g.
+// "8E060100" for `mov es, ds:[(SmcAnchor_0c33+1)]`); Text is the source
+// text JWasm printed for this row, with any trailing self-comment stripped.
+//
+// The motivating use case: an SMC slot at `anchor + N` may land inside an
+// instruction *after* the one labelled by the anchor (anchored regions
+// often span 2-3 instructions). Knowing per-instruction byte ranges lets
+// the index report which instruction actually contains the patched byte.
+type Instruction struct {
+	Addr  uint32
+	Size  uint32
+	Bytes string
+	Text  string
+}
+
 // ListingFile is the parsed view of a jwasm .lst file.
 type ListingFile struct {
 	Symbols []Symbol
+	// Instructions holds every code row JWasm assembled, sorted by Addr
+	// ascending. Built once at parse time; consumed via Index lookup.
+	Instructions []Instruction
 	// Path -> map of source line number -> address (for files we identified
 	// in the listing). Many lines have no address (comments, blank lines,
 	// EQU declarations that emit no bytes); those simply have no entry.
@@ -114,7 +134,12 @@ func ParseListing(path string) (*ListingFile, error) {
 			section = secSymbols
 			continue
 		}
-		if section != secProcedures && section != secSymbols {
+		if section == secNone || section == secMacros || section == secSegments {
+			// Body section: instruction and data rows. Most of these are
+			// not interesting, but instruction rows feed Instructions.
+			if instr, ok := parseInstructionRow(line); ok {
+				out.Instructions = append(out.Instructions, instr)
+			}
 			continue
 		}
 		// In the procedures section both flush-left rows (PROCs) and
@@ -228,6 +253,98 @@ func parseSymbolRow(line string) (Symbol, bool) {
 		}
 	}
 	return sym, true
+}
+
+// parseInstructionRow recognises a JWasm body row of the form
+//
+//	0000022E  8E060100            C         mov     es, ds:[...]               ; 022e  8e 06 34 0c
+//	^^^^^^^^  ^^^^^^^^            ^         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//	addr      bytes               marker    source-text                         self-comment
+//
+// Layout is fixed-column: addr in [0,8), 2 spaces, bytes in [10,30), the
+// segment-marker character at column 30 ('C' for CSEG code), source text
+// from column 31. Label-only rows (no bytes) and continuation/comment
+// rows (no leading addr) are rejected by returning ok=false.
+func parseInstructionRow(line string) (Instruction, bool) {
+	if len(line) < 32 || line[30] != 'C' {
+		return Instruction{}, false
+	}
+	addr, ok := parseHexFixed(line[:8])
+	if !ok {
+		return Instruction{}, false
+	}
+	bytesPart := strings.TrimSpace(line[10:30])
+	if bytesPart == "" {
+		// Label-only or struct-row -- no instruction emitted.
+		return Instruction{}, false
+	}
+	// JWasm allows non-hex characters here when expansion is partial; defend
+	// against that to keep the address index honest.
+	for i := 0; i < len(bytesPart); i++ {
+		c := bytesPart[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			return Instruction{}, false
+		}
+	}
+	text := strings.TrimSpace(stripJwasmSelfComment(line[31:]))
+	return Instruction{
+		Addr:  addr,
+		Size:  uint32(len(bytesPart) / 2),
+		Bytes: bytesPart,
+		Text:  text,
+	}, true
+}
+
+// parseHexFixed accepts exactly 8 hex digits. Used for the listing's
+// fixed-width address column where any non-hex character means we're
+// not on an instruction row.
+func parseHexFixed(s string) (uint32, bool) {
+	if len(s) != 8 {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(v), true
+}
+
+// stripJwasmSelfComment removes the auto-emitted "; <addr> <bytes>"
+// suffix JWasm appends to every assembled row. Only stripped when the
+// comment body is purely hex tokens -- so user comments like
+// "; PSP_TOP" or "; CLS=CS | flight.inc:418" pass through unchanged.
+func stripJwasmSelfComment(s string) string {
+	idx := strings.LastIndex(s, ";")
+	if idx < 0 {
+		return s
+	}
+	body := strings.TrimSpace(s[idx+1:])
+	if body == "" {
+		return s[:idx]
+	}
+	for _, tok := range strings.Fields(body) {
+		hex := true
+		for i := 0; i < len(tok); i++ {
+			c := tok[i]
+			isHex := (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')
+			if !isHex {
+				hex = false
+				break
+			}
+		}
+		if !hex {
+			return s
+		}
+	}
+	return s[:idx]
 }
 
 func parseHexVal(s string) (uint32, bool) {

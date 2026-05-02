@@ -3,8 +3,131 @@ package index
 import (
 	"testing"
 
+	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
 	"github.com/orlovsky/jwasm-mcp/internal/source"
 )
+
+// fixtureWithInstructions augments buildSmcFixture with a synthetic
+// instruction stream so tests can exercise InstructionAt /
+// InstructionsCovering. The layout mirrors the Var_d2a7 case: a 5-byte
+// `sub dx, ...` at d2a0 followed by a 4-byte `cmp dx, 80h` at d2a5,
+// with the +7 word slot landing at d2a7..d2a8 inside the cmp.
+func fixtureWithInstructions() *Index {
+	idx := buildSmcFixture()
+	// Add an extra anchor with a multi-instruction patched region.
+	multiFile := "detect.inc"
+	idx.Files[multiFile] = &source.File{
+		Path: multiFile,
+		Lines: []string{
+			"SmcAnchor_d2a0:: sub dx, cs:[Var_d3f6]",
+			"             cmp dx, 80h",
+		},
+	}
+	idx.Symbols["SmcAnchor_d2a0"] = []*SymbolEntry{{
+		Name: "SmcAnchor_d2a0", Kind: "export", File: multiFile, Line: 1,
+		Addr: 0xd2a0, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_d2a7"] = []*SymbolEntry{{
+		Name: "Var_d2a7", Kind: "EQU", File: "globals.inc", Line: 200,
+		Text: "word ptr SmcAnchor_d2a0 + 7",
+	}}
+	idx.instructions = []jwasm.Instruction{
+		{Addr: 0xd2a0, Size: 5, Bytes: "2B16f6d3", Text: "sub dx, cs:[Var_d3f6]"},
+		{Addr: 0xd2a5, Size: 4, Bytes: "81FA8000", Text: "cmp dx, 80h"},
+	}
+	return idx
+}
+
+func TestInstructionAt(t *testing.T) {
+	idx := fixtureWithInstructions()
+	cases := []struct {
+		addr     uint32
+		wantNil  bool
+		wantAddr uint32
+	}{
+		{0xd2a0, false, 0xd2a0},
+		{0xd2a4, false, 0xd2a0},
+		{0xd2a5, false, 0xd2a5},
+		{0xd2a7, false, 0xd2a5}, // slot byte lives inside cmp, not sub
+		{0xd2a8, false, 0xd2a5},
+		{0xd2a9, true, 0},
+	}
+	for _, c := range cases {
+		ins := idx.InstructionAt(c.addr)
+		if c.wantNil {
+			if ins != nil {
+				t.Errorf("addr=0x%x: expected nil, got %+v", c.addr, ins)
+			}
+			continue
+		}
+		if ins == nil || ins.Addr != c.wantAddr {
+			t.Errorf("addr=0x%x: got %+v, want addr=0x%x", c.addr, ins, c.wantAddr)
+		}
+	}
+}
+
+func TestInstructionsCovering(t *testing.T) {
+	idx := fixtureWithInstructions()
+	// Anchor at d2a0, slot at d2a7..d2a8 (word). Walk should return both
+	// the sub (anchor's first instr) and the cmp (slot-containing).
+	got := idx.InstructionsCovering(0xd2a0, 0xd2a9)
+	if len(got) != 2 {
+		t.Fatalf("got %d instructions, want 2: %+v", len(got), got)
+	}
+	if got[0].Addr != 0xd2a0 || got[1].Addr != 0xd2a5 {
+		t.Errorf("addrs: %x, %x", got[0].Addr, got[1].Addr)
+	}
+}
+
+func TestSymbolsCoveringRange(t *testing.T) {
+	idx := buildSmcFixture()
+	// Add a same-address overlap: word `VideoDetectResult` at the same
+	// addr as byte EQU `Var_d5c8`.
+	idx.Symbols["VideoDetectResult"] = []*SymbolEntry{{
+		Name: "VideoDetectResult", Kind: "data", File: "globals.inc", Line: 300,
+		Addr: 0xd5c8, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_d5c8"] = []*SymbolEntry{{
+		Name: "Var_d5c8", Kind: "EQU", File: "globals.inc", Line: 301,
+		Addr: 0xd5c8, HasAddr: true, Segment: "CSEG",
+	}}
+	syms := idx.SymbolsCoveringRange(0xd5c8, 0xd5c9)
+	if len(syms) != 2 {
+		t.Fatalf("got %d, want 2: %+v", len(syms), syms)
+	}
+	// Both should be in the result; order is by addr then name.
+	names := []string{syms[0].Name, syms[1].Name}
+	if names[0] != "Var_d5c8" || names[1] != "VideoDetectResult" {
+		t.Errorf("names: %v", names)
+	}
+}
+
+func TestSmcClustersByProc(t *testing.T) {
+	idx := buildSmcFixture()
+	// buildSmcFixture has FlightModelUpdate writing Var_a81b and Var_a81e.
+	// Both should land in one writer cluster of size 2.
+	clusters := idx.SmcClustersByProc("writer_proc", "", 2)
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1: %+v", len(clusters), clusters)
+	}
+	if clusters[0].Proc != "FlightModelUpdate" {
+		t.Errorf("proc: %q", clusters[0].Proc)
+	}
+	if len(clusters[0].Vars) != 2 {
+		t.Errorf("vars: %d", len(clusters[0].Vars))
+	}
+	if clusters[0].Role != "writer" {
+		t.Errorf("role: %q", clusters[0].Role)
+	}
+	// Reader query yields nothing here -- the fixture has no reader refs.
+	if r := idx.SmcClustersByProc("reader_proc", "", 2); len(r) != 0 {
+		t.Errorf("reader clusters: %d", len(r))
+	}
+	// proc filter narrows correctly.
+	if r := idx.SmcClustersByProc("writer_proc", "OtherProc", 2); len(r) != 0 {
+		t.Errorf("filter narrowed to OtherProc but got %d", len(r))
+	}
+}
 
 // buildSmcFixture returns a tiny index pre-populated with three anchors and
 // their var aliases, mimicking the FlightModelUpdate triple

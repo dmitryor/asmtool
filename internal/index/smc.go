@@ -358,6 +358,118 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 	return clusters
 }
 
+// SmcProcCluster groups SMC vars by a shared writer or reader PROC. This
+// is the analytic counterpart to SmcCluster: rather than asking "which
+// anchors sit next to each other in CSEG?" it asks "which anchors are
+// touched by the same PROC?" -- the key the math-batch case turns on
+// (8 matrix vars span ~150 source lines but a single reader PROC loads
+// them all back-to-back).
+type SmcProcCluster struct {
+	Proc    string         // the shared writer or reader PROC
+	Role    string         // "writer" | "reader"
+	Vars    []SmcAnchorRef // one entry per var the PROC touches; sorted by anchor address
+}
+
+// SmcClustersByProc returns clusters keyed by shared writer or reader
+// PROC. `kind` selects the access ("write" includes rw; "read" picks
+// up cmp/mov-from). `procFilter`, when non-empty, restricts output to a
+// single PROC. Clusters smaller than `minSize` are dropped.
+func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*SmcProcCluster {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if minSize < 1 {
+		minSize = 2
+	}
+
+	// Map var name -> SmcAnchorRef (anchor + slot + host instr).
+	varRefs := map[string]SmcAnchorRef{}
+	for name, decls := range idx.Symbols {
+		if !strings.HasPrefix(name, "Var_") {
+			continue
+		}
+		for _, s := range decls {
+			if s.Kind != "EQU" || s.Text == "" {
+				continue
+			}
+			slot, ok := ParseSmcEqu(s.Text)
+			if !ok {
+				continue
+			}
+			anchorDecls := idx.Symbols[slot.Anchor]
+			if len(anchorDecls) == 0 {
+				continue
+			}
+			anchor := anchorDecls[0]
+			varRefs[name] = SmcAnchorRef{
+				Anchor:    anchor,
+				Var:       s,
+				Slot:      slot,
+				HostInstr: idx.hostInstructionLocked(anchor),
+			}
+		}
+	}
+
+	// proc -> []var name (ordered by addr later)
+	procVars := map[string]map[string]bool{}
+	for varName := range varRefs {
+		for _, r := range idx.Refs[varName] {
+			if r.Kind != "mem" || r.EnclosingProc == "" {
+				continue
+			}
+			access := ClassifyAccess(r)
+			match := false
+			switch kind {
+			case "writer", "writer_proc", "write":
+				match = access == "write" || access == "rw"
+			case "reader", "reader_proc", "read":
+				match = access == "read" || access == "rw"
+			}
+			if !match {
+				continue
+			}
+			if procFilter != "" && r.EnclosingProc != procFilter {
+				continue
+			}
+			if procVars[r.EnclosingProc] == nil {
+				procVars[r.EnclosingProc] = map[string]bool{}
+			}
+			procVars[r.EnclosingProc][varName] = true
+		}
+	}
+
+	role := "writer"
+	if kind == "reader" || kind == "reader_proc" || kind == "read" {
+		role = "reader"
+	}
+
+	clusters := make([]*SmcProcCluster, 0, len(procVars))
+	for proc, varSet := range procVars {
+		if len(varSet) < minSize {
+			continue
+		}
+		c := &SmcProcCluster{Proc: proc, Role: role}
+		for v := range varSet {
+			ref, ok := varRefs[v]
+			if !ok {
+				continue
+			}
+			c.Vars = append(c.Vars, ref)
+		}
+		sort.Slice(c.Vars, func(i, j int) bool {
+			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
+		})
+		clusters = append(clusters, c)
+	}
+	// Sort: largest cluster first; tiebreak by proc name.
+	sort.Slice(clusters, func(i, j int) bool {
+		if len(clusters[i].Vars) != len(clusters[j].Vars) {
+			return len(clusters[i].Vars) > len(clusters[j].Vars)
+		}
+		return clusters[i].Proc < clusters[j].Proc
+	})
+	return clusters
+}
+
 // hostInstructionLocked is HostInstruction without taking the lock again
 // (caller already holds idx.mu).
 func (idx *Index) hostInstructionLocked(anchor *SymbolEntry) string {

@@ -79,6 +79,12 @@ type Index struct {
 
 	// Reverse references: for each symbol, all source uses.
 	Refs map[string][]*RefEntry
+
+	// Instructions (sorted by Addr ascending) carries the per-row address
+	// + size + source text JWasm produced. Populated when a listing is
+	// available; used by SMC tools to identify the instruction whose byte
+	// range contains a slot offset (anchor regions can span 2-3 instructions).
+	instructions []jwasm.Instruction
 }
 
 // Build assembles the Index from a slice of parsed source files plus an
@@ -95,6 +101,11 @@ func Build(files []*source.File, listing *jwasm.ListingFile) *Index {
 		for _, s := range listing.Symbols {
 			listingByName[s.Name] = s
 		}
+		// Copy + sort the instruction stream once; SMC queries binary-search it.
+		idx.instructions = append([]jwasm.Instruction(nil), listing.Instructions...)
+		sort.Slice(idx.instructions, func(i, j int) bool {
+			return idx.instructions[i].Addr < idx.instructions[j].Addr
+		})
 	}
 
 	for _, f := range files {
@@ -171,6 +182,90 @@ func Build(files []*source.File, listing *jwasm.ListingFile) *Index {
 		}
 	}
 	return idx
+}
+
+// InstructionAt returns the instruction whose byte range
+// [Addr, Addr+Size) contains addr, or nil if no match (or when no
+// listing has been parsed yet).
+func (idx *Index) InstructionAt(addr uint32) *jwasm.Instruction {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if len(idx.instructions) == 0 {
+		return nil
+	}
+	// Binary search for the largest Addr <= addr.
+	i := sort.Search(len(idx.instructions), func(i int) bool {
+		return idx.instructions[i].Addr > addr
+	})
+	if i == 0 {
+		return nil
+	}
+	candidate := &idx.instructions[i-1]
+	if addr < candidate.Addr || addr >= candidate.Addr+candidate.Size {
+		return nil
+	}
+	return candidate
+}
+
+// InstructionsCovering returns every instruction whose byte range overlaps
+// [start, end). Used to walk an SMC anchor region from its declaration
+// through the instruction containing the patch slot. The slice is in
+// ascending-address order; callers should not mutate it.
+func (idx *Index) InstructionsCovering(start, end uint32) []jwasm.Instruction {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if len(idx.instructions) == 0 || end <= start {
+		return nil
+	}
+	first := sort.Search(len(idx.instructions), func(i int) bool {
+		return idx.instructions[i].Addr+idx.instructions[i].Size > start
+	})
+	if first == len(idx.instructions) {
+		return nil
+	}
+	var out []jwasm.Instruction
+	for i := first; i < len(idx.instructions); i++ {
+		ins := idx.instructions[i]
+		if ins.Addr >= end {
+			break
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+// SymbolsCoveringRange returns every symbol declaration whose address
+// falls inside [start, end). Used by data_refs_at to find every alias
+// that maps onto a byte range -- for example the byte EQU `Var_d5c8` and
+// the word label `VideoDetectResult` both at 0xd5c8.
+//
+// Symbols without an address (sourceless EQUs, locals not in the listing)
+// are skipped.
+func (idx *Index) SymbolsCoveringRange(start, end uint32) []*SymbolEntry {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if end <= start {
+		return nil
+	}
+	var out []*SymbolEntry
+	for _, decls := range idx.Symbols {
+		for _, s := range decls {
+			if !s.HasAddr {
+				continue
+			}
+			if s.Addr < start || s.Addr >= end {
+				continue
+			}
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Addr != out[j].Addr {
+			return out[i].Addr < out[j].Addr
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 // FindSymbol returns all declarations of the given name.
