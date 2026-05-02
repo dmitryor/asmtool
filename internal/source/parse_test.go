@@ -137,6 +137,29 @@ TopGunList    equ 0eaf3h
 	}
 }
 
+func TestLabelKeywordDeclarations(t *testing.T) {
+	src := `
+VideoDetectResult       label word
+        dw      0
+DataAlias               label byte
+SomeAltEntry            label near
+`
+	f := parseString(t, src)
+	got := map[string]LabelKind{}
+	for _, l := range f.Labels {
+		got[l.Name] = l.Kind
+	}
+	if got["VideoDetectResult"] != LabelData {
+		t.Errorf("VideoDetectResult: %v, want %v", got["VideoDetectResult"], LabelData)
+	}
+	if got["DataAlias"] != LabelData {
+		t.Errorf("DataAlias: %v", got["DataAlias"])
+	}
+	if got["SomeAltEntry"] != LabelGlobal {
+		t.Errorf("SomeAltEntry: %v, want %v", got["SomeAltEntry"], LabelGlobal)
+	}
+}
+
 func TestNumericLiteralRejection(t *testing.T) {
 	src := `
 Foo PROC NEAR

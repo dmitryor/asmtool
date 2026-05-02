@@ -1191,7 +1191,7 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 		}
 		if instrs := idx.InstructionsCovering(anchor.Addr, end); len(instrs) > 0 {
 			arr := make([]map[string]any, 0, len(instrs))
-			var hostText, hostBytes string
+			var hostText, hostBytes, hostRole string
 			var hostAddr uint32
 			var hostSize uint32
 			for _, ins := range instrs {
@@ -1204,6 +1204,10 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 				if slotAddr >= ins.Addr && slotAddr < ins.Addr+ins.Size {
 					row["contains_slot"] = true
 					row["slot_byte_offset_in_instr"] = int(slotAddr - ins.Addr)
+					if role := index.ClassifyHostRole(ins.Text); role != "" {
+						row["role"] = role
+						hostRole = role
+					}
 					hostText = ins.Text
 					hostBytes = ins.Bytes
 					hostAddr = ins.Addr
@@ -1214,12 +1218,16 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 			res["host_instructions"] = arr
 			// Backwards-compat singular: prefer the slot-containing one.
 			if hostText != "" {
-				res["host_instruction"] = map[string]any{
+				host := map[string]any{
 					"addr":     fmt.Sprintf("0x%04x", hostAddr),
 					"size":     hostSize,
 					"encoding": hostBytes,
 					"text":     hostText,
 				}
+				if hostRole != "" {
+					host["role"] = hostRole
+				}
+				res["host_instruction"] = host
 			}
 		}
 	}
@@ -1228,19 +1236,19 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 	// so callers that previously read host_instruction.text for *anchor*
 	// (not slot) text still have access to it.
 	if instr := idx.HostInstruction(anchor); instr != "" {
-		res["host_instruction_source"] = map[string]any{
+		srcEntry := map[string]any{
 			"file": filepath.Base(anchor.File),
 			"line": anchor.Line,
 			"text": instr,
 		}
+		if role := index.ClassifyHostRole(instr); role != "" {
+			srcEntry["role"] = role
+		}
+		res["host_instruction_source"] = srcEntry
 		// If the listing wasn't available we never set host_instruction;
 		// fall back to the source line so the field is never missing.
 		if _, ok := res["host_instruction"]; !ok {
-			res["host_instruction"] = map[string]any{
-				"file": filepath.Base(anchor.File),
-				"line": anchor.Line,
-				"text": instr,
-			}
+			res["host_instruction"] = srcEntry
 		}
 	}
 

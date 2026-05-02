@@ -53,9 +53,12 @@ Composite:
 - `smc_var_info(name)` — SMC slot resolver: takes either a `Var_NNNN` EQU
   alias or its `SmcAnchor_NNNN` host label and returns the typed slot
   (size + offset), the anchor address, every instruction from the
-  anchor through the slot byte (with byte encoding and a
-  `contains_slot` marker on the patched one), and a writer/reader
-  split (memory-operand refs classified by access).
+  anchor through the slot byte (with byte encoding, a
+  `contains_slot` marker, and a coarse `role` tag on the patched
+  one — `value_load_imm`, `threshold`, `delta`, `deferred_write`,
+  `mask`, `shift`, `interrupt_vector`, `data_filler`, `jump_target`,
+  `stack_anchor`), and a writer/reader split (memory-operand refs
+  classified by access).
 - `smc_clusters(by?, proc?, file?, max_gap?, min_size?)` — group SMC
   anchors. Two modes:
   - `by="proximity"` (default): same source file + addr gap ≤

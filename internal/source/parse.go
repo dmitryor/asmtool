@@ -140,6 +140,31 @@ func peelLabel(code string) (name string, kind LabelKind, rest string) {
 		return id, LabelEqu, trimmed[j:]
 	case "macro":
 		return id, LabelMacro, trimmed[j:]
+	case "label":
+		// `Name LABEL <type>` aliases the next emitted bytes (data form)
+		// or a code position (near/far form). Pick the existing kind that
+		// matches each case so downstream consumers can treat aliases
+		// uniformly with their non-aliased counterparts.
+		typ := ""
+		t := k
+		for t < len(trimmed) && (trimmed[t] == ' ' || trimmed[t] == '\t') {
+			t++
+		}
+		te := t
+		for te < len(trimmed) && isIdentByte(trimmed[te]) {
+			te++
+		}
+		if te > t {
+			typ = strings.ToLower(trimmed[t:te])
+		}
+		switch typ {
+		case "near", "far":
+			return id, LabelGlobal, trimmed[j:]
+		default:
+			// byte/word/dword/qword/tbyte/fword and unknown sizes all
+			// map to data-typed alias.
+			return id, LabelData, trimmed[j:]
+		}
 	}
 	return "", LabelUnknown, code
 }
@@ -411,7 +436,7 @@ func parseReader(path string, r io.Reader) (*File, error) {
 				currentProc = nil
 			}
 			continue
-		case tok == "macro" || tok == "endm" || tok == "equ" || closer == "endm":
+		case tok == "macro" || tok == "endm" || tok == "equ" || tok == "label" || closer == "endm":
 			continue
 		case tok == "include":
 			parts := strings.Fields(rest)
