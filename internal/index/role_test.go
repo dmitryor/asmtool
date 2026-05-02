@@ -45,6 +45,13 @@ func TestClassifyHostRole(t *testing.T) {
 		{"out dx, ax", ""},
 		// label-prefixed
 		{"Foo: mov bx, 0", "value_load_imm"},
+		// encoding-macro fallback: prefix-as-mnemonic
+		{"cmp_ax_imm16_long Var_b500", "threshold"},
+		{"mov_bh_bx_disp16 Var_xxxx", "value_load_imm"},
+		{"or_bx_imm16_long 0fff8h", "mask"},
+		{"mov_reg_reg_88 0e1h", "value_load_imm"},
+		// underscore-prefixed but unknown root → no rule
+		{"foo_bar_baz", ""},
 	}
 	for _, c := range cases {
 		got := ClassifyHostRole(c.text)

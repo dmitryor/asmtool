@@ -41,6 +41,19 @@ func ClassifyHostRole(text string) string {
 	mnem := strings.ToLower(s[:i])
 	rest := strings.TrimSpace(s[i:])
 
+	// Encoding-macro fallback: this codebase uses macros like
+	// `cmp_ax_imm16_long`, `mov_bh_bx_disp16`, `or_bx_imm16_long` that
+	// force a specific JWasm encoding for the underlying opcode. The
+	// macro name's underscore-prefix is the actual mnemonic, so we
+	// re-key on it when the full token isn't a known mnemonic. Without
+	// this, every patched cmp/mov inside an encoding macro would lose
+	// its role tag.
+	if !mnemonicHasRule(mnem) {
+		if u := strings.IndexByte(mnem, '_'); u > 0 && mnemonicHasRule(mnem[:u]) {
+			mnem = mnem[:u]
+		}
+	}
+
 	// Destination operand = text before the first top-level comma. We don't
 	// need to walk brackets perfectly here -- the dst-vs-src split for the
 	// patterns we care about is unambiguous in the codebase.
@@ -87,6 +100,28 @@ func ClassifyHostRole(text string) string {
 		return "jump_target"
 	}
 	return ""
+}
+
+// mnemonicHasRule reports whether the role classifier has a rule for the
+// given mnemonic. Used by the encoding-macro fallback to decide whether a
+// trimmed prefix counts as the underlying opcode.
+func mnemonicHasRule(m string) bool {
+	switch m {
+	case "mov", "movzx", "movsx", "lea",
+		"cmp", "test",
+		"add", "sub", "adc", "sbb", "inc", "dec",
+		"and", "or", "xor",
+		"shl", "shr", "sar", "sal", "rol", "ror", "rcl", "rcr",
+		"int", "into",
+		"db", "dw", "dd", "dq", "dt", "df",
+		"jmp", "call",
+		"je", "jne", "jz", "jnz", "jg", "jge", "jl", "jle",
+		"ja", "jae", "jb", "jbe", "jc", "jnc", "jo", "jno",
+		"js", "jns", "jp", "jnp", "jpe", "jpo", "jcxz", "jecxz",
+		"loop", "loope", "loopne", "loopz", "loopnz":
+		return true
+	}
+	return false
 }
 
 // indexTopComma returns the index of the first comma at bracket depth 0,

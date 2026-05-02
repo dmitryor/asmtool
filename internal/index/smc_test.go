@@ -102,6 +102,80 @@ func TestSymbolsCoveringRange(t *testing.T) {
 	}
 }
 
+func TestSiblingSlotRelations(t *testing.T) {
+	idx := buildSmcFixture()
+	// Add the round-4 sibling pair: Var_ae68 word@+1 (bytes 1..2) and
+	// Var_ae69 byte@+2 (byte 2). Var_ae69 is the high byte of Var_ae68.
+	idx.Symbols["SmcAnchor_ae67"] = []*SymbolEntry{{
+		Name: "SmcAnchor_ae67", Kind: "export", File: "render3d.inc", Line: 5,
+		Addr: 0xae67, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_ae68"] = []*SymbolEntry{{
+		Name: "Var_ae68", Kind: "EQU", File: "globals.inc", Line: 400,
+		Text: "word ptr SmcAnchor_ae67 + 1",
+	}}
+	idx.Symbols["Var_ae69"] = []*SymbolEntry{{
+		Name: "Var_ae69", Kind: "EQU", File: "globals.inc", Line: 401,
+		Text: "byte ptr SmcAnchor_ae67 + 2",
+	}}
+
+	// Var_ae69 is the high byte of Var_ae68 → byte_slice_of.
+	rels := idx.SiblingSlotRelations("Var_ae69", "SmcAnchor_ae67",
+		SmcSlot{Anchor: "SmcAnchor_ae67", Size: "byte", Offset: 2})
+	if len(rels) != 1 {
+		t.Fatalf("Var_ae69 relations: %d, want 1", len(rels))
+	}
+	if rels[0].Kind != "byte_slice_of" || rels[0].Sibling != "Var_ae68" {
+		t.Errorf("Var_ae69: %+v", rels[0])
+	}
+
+	// And the inverse: Var_ae68 contains Var_ae69 → contains_byte_slice.
+	rels = idx.SiblingSlotRelations("Var_ae68", "SmcAnchor_ae67",
+		SmcSlot{Anchor: "SmcAnchor_ae67", Size: "word", Offset: 1})
+	if len(rels) != 1 {
+		t.Fatalf("Var_ae68 relations: %d, want 1", len(rels))
+	}
+	if rels[0].Kind != "contains_byte_slice" || rels[0].Sibling != "Var_ae69" {
+		t.Errorf("Var_ae68: %+v", rels[0])
+	}
+
+	// A solitary slot (Var_a720, the only var aliasing SmcAnchor_a71f
+	// in the fixture) has no relations.
+	rels = idx.SiblingSlotRelations("Var_a720", "SmcAnchor_a71f",
+		SmcSlot{Anchor: "SmcAnchor_a71f", Size: "word", Offset: 1})
+	if len(rels) != 0 {
+		t.Errorf("Var_a720 should have no relations; got %+v", rels)
+	}
+}
+
+func TestVarD2a7MultiInstructionWalk(t *testing.T) {
+	// End-to-end check on the round-2 wart: the +7 word slot of
+	// SmcAnchor_d2a0 lands inside the cmp at d2a5 (instruction 2),
+	// not the sub at d2a0 (instruction 1). The instruction stream
+	// produces both, with contains_slot=true on the cmp.
+	idx := fixtureWithInstructions()
+	slot := SmcSlot{Anchor: "SmcAnchor_d2a0", Size: "word", Offset: 7}
+	slotAddr := uint32(0xd2a0) + uint32(slot.Offset)
+	end := slotAddr + 2
+	got := idx.InstructionsCovering(0xd2a0, end)
+	if len(got) != 2 {
+		t.Fatalf("got %d instrs, want 2", len(got))
+	}
+	if got[0].Addr != 0xd2a0 || got[1].Addr != 0xd2a5 {
+		t.Errorf("addrs: %x, %x", got[0].Addr, got[1].Addr)
+	}
+	// Slot byte must lie inside the second instruction, not the first.
+	containsIdx := -1
+	for i, ins := range got {
+		if slotAddr >= ins.Addr && slotAddr < ins.Addr+ins.Size {
+			containsIdx = i
+		}
+	}
+	if containsIdx != 1 {
+		t.Errorf("slot containment index: got %d, want 1 (the cmp)", containsIdx)
+	}
+}
+
 func TestSmcClustersByProc(t *testing.T) {
 	idx := buildSmcFixture()
 	// buildSmcFixture has FlightModelUpdate writing Var_a81b and Var_a81e.

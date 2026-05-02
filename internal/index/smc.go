@@ -358,6 +358,83 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 	return clusters
 }
 
+// SiblingSlotRelation describes how two Var_* slots aliasing the same
+// SmcAnchor overlap each other in the patched instruction's byte range.
+// The motivating case: SmcAnchor_ae67 has Var_ae68 (word at +1, bytes
+// 1..2) and Var_ae69 (byte at +2, byte 2). Var_ae69 is the high byte
+// of Var_ae68.
+type SiblingSlotRelation struct {
+	// Kind is one of:
+	//   byte_slice_of       -- this var sits fully inside the sibling
+	//   contains_byte_slice -- this var fully contains the sibling
+	//   co_located          -- exact same byte range (different typing)
+	//   overlaps            -- partial overlap (fallback; rare)
+	Kind        string
+	Sibling     string
+	SiblingSlot SmcSlot
+}
+
+// SiblingSlotRelations returns the overlap relationships between the
+// queried var's slot and every other Var_* aliasing the same anchor.
+// Returns nil when no other var aliases the anchor or when the slot
+// size is unknown.
+func (idx *Index) SiblingSlotRelations(name, anchorName string, slot SmcSlot) []SiblingSlotRelation {
+	mySize := slotSizeBytes(slot.Size)
+	if mySize == 0 {
+		return nil
+	}
+	myStart := slot.Offset
+	myEnd := myStart + mySize
+	var out []SiblingSlotRelation
+	for _, sib := range idx.FindEquAliasesOf(anchorName) {
+		if sib.Name == name {
+			continue
+		}
+		sl, ok := ParseSmcEqu(sib.Text)
+		if !ok {
+			continue
+		}
+		sibSize := slotSizeBytes(sl.Size)
+		if sibSize == 0 {
+			continue
+		}
+		sibStart := sl.Offset
+		sibEnd := sibStart + sibSize
+		if sibEnd <= myStart || sibStart >= myEnd {
+			continue
+		}
+		kind := "overlaps"
+		switch {
+		case sibStart == myStart && sibEnd == myEnd:
+			kind = "co_located"
+		case sibStart <= myStart && sibEnd >= myEnd:
+			kind = "byte_slice_of"
+		case myStart <= sibStart && myEnd >= sibEnd:
+			kind = "contains_byte_slice"
+		}
+		out = append(out, SiblingSlotRelation{
+			Kind:        kind,
+			Sibling:     sib.Name,
+			SiblingSlot: sl,
+		})
+	}
+	return out
+}
+
+// slotSizeBytes maps a slot size token to the byte count it covers.
+// Returns 0 for unknown sizes so callers can skip them.
+func slotSizeBytes(s string) int {
+	switch s {
+	case "byte":
+		return 1
+	case "word":
+		return 2
+	case "dword":
+		return 4
+	}
+	return 0
+}
+
 // SmcProcCluster groups SMC vars by a shared writer or reader PROC. This
 // is the analytic counterpart to SmcCluster: rather than asking "which
 // anchors sit next to each other in CSEG?" it asks "which anchors are

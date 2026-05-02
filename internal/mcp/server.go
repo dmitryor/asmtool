@@ -1151,13 +1151,34 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	anchor := anchorDecls[0]
 
+	slotEntry := map[string]any{
+		"size":   slot.Size,
+		"offset": slot.Offset,
+	}
+	// Sibling-overlap detection: when more than one Var_* aliases the
+	// same SmcAnchor, vars whose byte ranges overlap are byte-slice
+	// views of each other. The agent's round-4 idea: surface the
+	// relationship so high-byte-of / low-byte-of patterns are
+	// self-documenting (Var_ae68 word at +1, Var_ae69 byte at +2 →
+	// Var_ae69 is the high byte of Var_ae68).
+	if relations := idx.SiblingSlotRelations(varDecl.Name, anchor.Name, slot); len(relations) > 0 {
+		rels := make([]map[string]any, 0, len(relations))
+		for _, r := range relations {
+			rels = append(rels, map[string]any{
+				"kind":    r.Kind,
+				"sibling": r.Sibling,
+				"sibling_slot": map[string]any{
+					"size":   r.SiblingSlot.Size,
+					"offset": r.SiblingSlot.Offset,
+				},
+			})
+		}
+		slotEntry["relations"] = rels
+	}
 	res := map[string]any{
 		"var":    varDecl.Name,
 		"anchor": anchor.Name,
-		"slot": map[string]any{
-			"size":   slot.Size,
-			"offset": slot.Offset,
-		},
+		"slot":   slotEntry,
 		"var_decl": map[string]any{
 			"file": filepath.Base(varDecl.File),
 			"line": varDecl.Line,
