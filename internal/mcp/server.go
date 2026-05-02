@@ -213,6 +213,18 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 			mcp.Description("Max entries to return (default 200)")),
 	), s.handleScanBlockers)
 
+	srv.AddTool(mcp.NewTool("smc_clusters",
+		mcp.WithDescription("Group SMC anchors that sit close together in CSEG into clusters -- typically the runs of 2-3 consecutive immediates a single writer PROC patches at once. Two anchors are placed in the same cluster when they share a source file and their CSEG addresses are within `max_gap` bytes of each other (default 16). Each cluster surfaces its members (anchor, var alias, slot info, host instruction) plus the distinct PROCs that write to any var in it -- the natural unit of SMC analysis when annotating a 100+-var backlog. Use this BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
+		mcp.WithString("file",
+			mcp.Description("Optional: limit scan to a single source file (basename or absolute path)")),
+		mcp.WithNumber("max_gap",
+			mcp.Description("Max byte gap between consecutive anchors to keep them in the same cluster (default 16)")),
+		mcp.WithNumber("min_size",
+			mcp.Description("Minimum cluster size -- singletons are usually noise (default 2)")),
+		mcp.WithNumber("limit",
+			mcp.Description("Max clusters to return (default 50)")),
+	), s.handleSmcClusters)
+
 	srv.AddTool(mcp.NewTool("smc_var_info",
 		mcp.WithDescription("Composite read for a self-modifying-code variable. Accepts either the Var_NNNN EQU alias or its SmcAnchor_NNNN host label, and returns the var's typed-pointer slot (size + byte offset), the anchor declaration with address, the host instruction's source line, and a writer/reader split derived from access classification of every memory-operand ref. Replaces the four-call dance (read globals.inc EQU + find_symbol(anchor) + Read host line + find_data_refs(var)) with one call -- the natural primitive for the SMC-annotation worklist."),
 		mcp.WithString("name", mcp.Required(),
@@ -462,7 +474,8 @@ func (s *Server) handleAddrToLocation(ctx context.Context, req mcp.CallToolReque
 	if err != nil {
 		return errResult(err.Error()), nil
 	}
-	p := s.Index().AddrToProc(addr)
+	idx := s.Index()
+	p := idx.AddrToProc(addr)
 	if p == nil {
 		// Could be in globals_lo/_hi (above last PROC's end_addr) or simply
 		// outside CSEG. Surface that to the caller.
@@ -473,14 +486,39 @@ func (s *Server) handleAddrToLocation(ctx context.Context, req mcp.CallToolReque
 		}), nil
 	}
 	offsetWithin := addr - p.Addr
-	return jsonText(map[string]any{
+	res := map[string]any{
 		"found":          true,
 		"addr":           fmt.Sprintf("0x%04x", addr),
 		"proc":           p.Name,
 		"file":           filepath.Base(p.File),
 		"proc_start":     fmt.Sprintf("0x%04x", p.Addr),
 		"offset_in_proc": fmt.Sprintf("0x%x", offsetWithin),
-	}), nil
+	}
+	// SMC enrichment: if the addr lands on an anchor (or one of its var-aliased
+	// slots) we already know the host instruction without making the caller
+	// open the source file. Surface it inline so addr->host-instr is a single
+	// query for the agent's SMC-annotation worklist.
+	if site := idx.SmcSiteAt(addr); site != nil {
+		smc := map[string]any{
+			"anchor":           site.Anchor.Name,
+			"anchor_addr":      fmt.Sprintf("0x%04x", site.Anchor.Addr),
+			"host_instruction": site.HostInstruction,
+			"src_file":         filepath.Base(site.Anchor.File),
+			"src_line":         site.Anchor.Line,
+		}
+		if site.Var != nil {
+			smc["var"] = site.Var.Name
+			smc["slot"] = map[string]any{
+				"size":   site.Slot.Size,
+				"offset": site.Slot.Offset,
+			}
+			smc["role"] = "slot"
+		} else {
+			smc["role"] = "anchor"
+		}
+		res["smc_site"] = smc
+	}
+	return jsonText(res), nil
 }
 
 func (s *Server) handleFindSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -821,6 +859,74 @@ func (s *Server) handleScanBlockers(ctx context.Context, req mcp.CallToolRequest
 		"probable":   bucket[classify.ProbableAddress],
 		"ambiguous":  bucket[classify.AmbiguousAddress],
 		"candidates": out,
+	}), nil
+}
+
+// handleSmcClusters returns SMC anchors grouped by spatial proximity --
+// the high-level view of "which anchors are written together by one PROC."
+// See Index.SmcClusters for the grouping heuristic.
+func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	fileFilter := req.GetString("file", "")
+	maxGap := uint32(req.GetFloat("max_gap", 16))
+	if maxGap == 0 {
+		maxGap = 16
+	}
+	minSize := int(req.GetFloat("min_size", 2))
+	if minSize < 1 {
+		minSize = 2
+	}
+	limit := int(req.GetFloat("limit", 50))
+	if limit <= 0 {
+		limit = 50
+	}
+	idx := s.Index()
+	var fileAbs string
+	if fileFilter != "" {
+		fileAbs = s.resolveFile(fileFilter)
+	}
+	clusters := idx.SmcClusters(fileAbs, maxGap, minSize)
+	total := len(clusters)
+	if len(clusters) > limit {
+		clusters = clusters[:limit]
+	}
+	out := make([]map[string]any, 0, len(clusters))
+	for _, c := range clusters {
+		anchors := make([]map[string]any, 0, len(c.Anchors))
+		for _, a := range c.Anchors {
+			row := map[string]any{
+				"anchor":           a.Anchor.Name,
+				"addr":             fmt.Sprintf("0x%04x", a.Anchor.Addr),
+				"line":             a.Anchor.Line,
+				"host_instruction": a.HostInstr,
+			}
+			if a.Var != nil {
+				row["var"] = a.Var.Name
+				row["slot"] = map[string]any{
+					"size":   a.Slot.Size,
+					"offset": a.Slot.Offset,
+				}
+			}
+			anchors = append(anchors, row)
+		}
+		entry := map[string]any{
+			"file":         filepath.Base(c.File),
+			"start_addr":   fmt.Sprintf("0x%04x", c.StartAddr),
+			"end_addr":     fmt.Sprintf("0x%04x", c.EndAddr),
+			"size_bytes":   c.EndAddr - c.StartAddr,
+			"anchor_count": len(c.Anchors),
+			"anchors":      anchors,
+		}
+		if len(c.Procs) > 0 {
+			entry["writer_procs"] = c.Procs
+		}
+		out = append(out, entry)
+	}
+	return jsonText(map[string]any{
+		"total":    total,
+		"shown":    len(out),
+		"max_gap":  maxGap,
+		"min_size": minSize,
+		"clusters": out,
 	}), nil
 }
 

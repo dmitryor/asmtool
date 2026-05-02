@@ -34,7 +34,11 @@ Read-only navigation:
   for `@@`-local labels (pass `in_proc` to narrow)
 - `find_callees(name)` — outgoing call/jmp targets from a PROC
 - `module_layout(file)` — PROCs in a module with addr/size info
-- `addr_to_location(addr)` — map a CS offset to file:line + enclosing PROC
+- `addr_to_location(addr)` — map a CS offset to file:line + enclosing PROC.
+  When the addr lands on an SMC anchor (or on one of its var-aliased
+  patch slots) the response also surfaces the anchor name, host
+  instruction, and slot info — a single round-trip for the agent's SMC
+  worklist.
 - `find_symbol(name)` — every declaration site of a name
 
 Composite:
@@ -45,6 +49,11 @@ Composite:
   alias or its `SmcAnchor_NNNN` host label and returns the typed slot
   (size + offset), the anchor address, the host instruction, and a
   writer/reader split (memory-operand refs classified by access).
+- `smc_clusters(file?, max_gap?, min_size?)` — group SMC anchors by
+  spatial proximity in CSEG. Two anchors share a cluster when they're
+  in the same source file and within `max_gap` bytes (default 16). Each
+  cluster surfaces its members + the writer PROCs that touch any var in
+  it — the natural unit when annotating a 100+-var backlog.
 - `unresolved(kind, limit)` — scaffolding backlog ranked by reference count;
   `kind` ∈ `procs` (default), `data`, `all`
 
@@ -91,6 +100,24 @@ Write tool:
                                            writers/readers in one call
 3. propose a semantic name (often based on what the writers compute)
 4. rename_symbol(old, new, dry_run=true / false)
+```
+
+### Annotate a cluster of SMC anchors at once
+
+```
+1. smc_clusters()                        → groups of anchors patched together
+2. function_context(<writer_proc>)       → see what the writer is computing
+3. name the cluster's purpose, then    → anchors share the same role
+   rename each Var_NNNN inside it.
+```
+
+For an arbitrary CSEG offset (e.g. from a Ghidra cross-reference):
+
+```
+1. addr_to_location(0xa720)              → file:line + PROC; if the addr
+                                           is an SMC slot, the response
+                                           also includes anchor name,
+                                           host instruction, and slot info
 ```
 
 ### Map a Ghidra address to source
