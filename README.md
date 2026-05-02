@@ -62,13 +62,18 @@ Composite:
   `cmp_ax_imm16_long` are classified by their underscore prefix), and a
   writer/reader split (memory-operand refs classified by access).
 - `smc_clusters(by?, proc?, file?, max_gap?, min_size?)` — group SMC
-  anchors. Two modes:
+  anchors. Three modes:
   - `by="proximity"` (default): same source file + addr gap ≤
     `max_gap`. Catches consecutive-immediate runs.
   - `by="writer_proc"` / `by="reader_proc"`: vars touched by the
     same PROC. Catches matrix-broadcast patterns (4-8 SMC slots
     written by one PROC, read by another, even when they span
-    ~150 source lines).
+    ~150 source lines). Module-scope refs surface under the
+    synthetic key `<basename>:module-scope`.
+  - `by="writer_file"` / `by="reader_file"`: coarser, file-keyed
+    grouping. Right shape for module-scope setup blocks (e.g.
+    polydraw.inc's 18 SMC slots all written at file scope without
+    a PROC wrapper).
 - `unresolved(kind, limit)` — scaffolding backlog ranked by reference count;
   `kind` ∈ `procs` (default), `data`, `all`
 

@@ -222,13 +222,13 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 	), s.handleDataRefsAt)
 
 	srv.AddTool(mcp.NewTool("smc_clusters",
-		mcp.WithDescription("Group SMC anchors into clusters. Two grouping modes:\n  - by=\"proximity\" (default): anchors that share a source file AND lie within `max_gap` bytes of each other (default 16). Catches runs of 2-3 consecutive immediates patched together.\n  - by=\"writer_proc\" / \"reader_proc\": vars touched by the same PROC. Catches matrix-broadcast patterns where a single PROC reads or writes 4+ slots back-to-back even when they span ~150 source lines.\nEach cluster surfaces its members (anchor, var alias, slot info, host instruction). Proximity clusters also list the writer PROCs that touch any var in the cluster. Use proc-keyed clustering BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
+		mcp.WithDescription("Group SMC anchors into clusters. Three grouping modes:\n  - by=\"proximity\" (default): anchors that share a source file AND lie within `max_gap` bytes of each other (default 16). Catches runs of 2-3 consecutive immediates patched together.\n  - by=\"writer_proc\" / \"reader_proc\": vars touched by the same PROC. Catches matrix-broadcast patterns where a single PROC reads or writes 4+ slots back-to-back even when they span ~150 source lines. Module-scope refs surface under the synthetic key `<file>:module-scope`.\n  - by=\"writer_file\" / \"reader_file\": coarser, file-keyed grouping. Right shape for module-scope setup blocks (e.g. polydraw.inc's 18 SMC slots all written at file scope without a PROC wrapper).\nEach cluster surfaces its members (anchor, var alias, slot info, host instruction). Proximity clusters also list the writer PROCs that touch any var in the cluster. Use proc/file-keyed clustering BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
 		mcp.WithString("by",
-			mcp.Description("Cluster key: 'proximity' (default), 'writer_proc', or 'reader_proc'")),
+			mcp.Description("Cluster key: 'proximity' (default), 'writer_proc', 'reader_proc', 'writer_file', 'reader_file'")),
 		mcp.WithString("proc",
-			mcp.Description("With by=writer_proc/reader_proc: filter to one PROC")),
+			mcp.Description("With by=writer_proc/reader_proc: filter to one PROC name. For module-scope refs use '<basename>:module-scope'.")),
 		mcp.WithString("file",
-			mcp.Description("With by=proximity: limit scan to a single source file (basename or absolute path)")),
+			mcp.Description("With by=proximity: limit anchor scan to a single source file. With by=writer_file/reader_file: limit cluster output to vars whose writers/readers live in that file.")),
 		mcp.WithNumber("max_gap",
 			mcp.Description("With by=proximity: max byte gap between consecutive anchors (default 16)")),
 		mcp.WithNumber("min_size",
@@ -1006,15 +1006,26 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 	idx := s.Index()
 
 	switch by {
-	case "writer_proc", "reader_proc", "writer", "reader":
+	case "writer_proc", "reader_proc", "writer", "reader",
+		"writer_file", "reader_file":
 		role := "writer"
-		if by == "reader_proc" || by == "reader" {
+		if by == "reader_proc" || by == "reader" || by == "reader_file" {
 			role = "reader"
 		}
-		procClusters := idx.SmcClustersByProc(by, procFilter, minSize)
+		var procClusters []*index.SmcProcCluster
+		switch by {
+		case "writer_file", "reader_file":
+			procClusters = idx.SmcClustersByFile(by, fileFilter, minSize)
+		default:
+			procClusters = idx.SmcClustersByProc(by, procFilter, minSize)
+		}
 		total := len(procClusters)
 		if len(procClusters) > limit {
 			procClusters = procClusters[:limit]
+		}
+		groupKey := "proc"
+		if by == "writer_file" || by == "reader_file" {
+			groupKey = "file"
 		}
 		out := make([]map[string]any, 0, len(procClusters))
 		for _, c := range procClusters {
@@ -1032,7 +1043,7 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 				vars = append(vars, row)
 			}
 			entry := map[string]any{
-				"proc":      c.Proc,
+				groupKey:    c.Proc,
 				"role":      c.Role,
 				"var_count": len(c.Vars),
 				"vars":      vars,

@@ -447,6 +447,123 @@ type SmcProcCluster struct {
 	Vars    []SmcAnchorRef // one entry per var the PROC touches; sorted by anchor address
 }
 
+// ModuleScopeProcKey synthesizes a stable proc-name substitute for
+// references that have no enclosing PROC. Format: "<basename>:module-scope".
+// The colon prevents collision with real PROC names (assembly identifiers
+// don't allow colons mid-token) so the key is visually distinguishable in
+// any output that lists PROC names.
+func ModuleScopeProcKey(absPath string) string {
+	base := absPath
+	if i := strings.LastIndexAny(absPath, "/\\"); i >= 0 {
+		base = absPath[i+1:]
+	}
+	return base + ":module-scope"
+}
+
+// SmcClustersByFile returns clusters keyed by the source file of a var's
+// writer or reader refs. Coarser than by-PROC: catches setup-block
+// patterns where a whole module's worth of SMC writes happen at module
+// scope (polydraw.inc's 18 vars) without splitting them across the
+// synthetic per-file pseudo-PROCs by-PROC mode would emit.
+//
+// Returns SmcProcCluster instances with the file basename in `Proc` and
+// `Role` set to "writer" or "reader".
+func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*SmcProcCluster {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if minSize < 1 {
+		minSize = 2
+	}
+
+	varRefs := map[string]SmcAnchorRef{}
+	for name, decls := range idx.Symbols {
+		if !strings.HasPrefix(name, "Var_") {
+			continue
+		}
+		for _, s := range decls {
+			if s.Kind != "EQU" || s.Text == "" {
+				continue
+			}
+			slot, ok := ParseSmcEqu(s.Text)
+			if !ok {
+				continue
+			}
+			anchorDecls := idx.Symbols[slot.Anchor]
+			if len(anchorDecls) == 0 {
+				continue
+			}
+			anchor := anchorDecls[0]
+			varRefs[name] = SmcAnchorRef{
+				Anchor:    anchor,
+				Var:       s,
+				Slot:      slot,
+				HostInstr: idx.hostInstructionLocked(anchor),
+			}
+		}
+	}
+
+	fileVars := map[string]map[string]bool{}
+	for varName := range varRefs {
+		for _, r := range idx.Refs[varName] {
+			if r.Kind != "mem" {
+				continue
+			}
+			access := ClassifyAccess(r)
+			match := false
+			switch kind {
+			case "writer", "writer_file", "write":
+				match = access == "write" || access == "rw"
+			case "reader", "reader_file", "read":
+				match = access == "read" || access == "rw"
+			}
+			if !match {
+				continue
+			}
+			base := r.File
+			if i := strings.LastIndexAny(r.File, "/\\"); i >= 0 {
+				base = r.File[i+1:]
+			}
+			if fileFilter != "" && base != fileFilter && r.File != fileFilter {
+				continue
+			}
+			if fileVars[base] == nil {
+				fileVars[base] = map[string]bool{}
+			}
+			fileVars[base][varName] = true
+		}
+	}
+
+	role := "writer"
+	if kind == "reader" || kind == "reader_file" || kind == "read" {
+		role = "reader"
+	}
+	clusters := make([]*SmcProcCluster, 0, len(fileVars))
+	for file, varSet := range fileVars {
+		if len(varSet) < minSize {
+			continue
+		}
+		c := &SmcProcCluster{Proc: file, Role: role}
+		for v := range varSet {
+			ref, ok := varRefs[v]
+			if !ok {
+				continue
+			}
+			c.Vars = append(c.Vars, ref)
+		}
+		sort.Slice(c.Vars, func(i, j int) bool {
+			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
+		})
+		clusters = append(clusters, c)
+	}
+	sort.Slice(clusters, func(i, j int) bool {
+		if len(clusters[i].Vars) != len(clusters[j].Vars) {
+			return len(clusters[i].Vars) > len(clusters[j].Vars)
+		}
+		return clusters[i].Proc < clusters[j].Proc
+	})
+	return clusters
+}
+
 // SmcClustersByProc returns clusters keyed by shared writer or reader
 // PROC. `kind` selects the access ("write" includes rw; "read" picks
 // up cmp/mov-from). `procFilter`, when non-empty, restricts output to a
@@ -490,7 +607,7 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 	procVars := map[string]map[string]bool{}
 	for varName := range varRefs {
 		for _, r := range idx.Refs[varName] {
-			if r.Kind != "mem" || r.EnclosingProc == "" {
+			if r.Kind != "mem" {
 				continue
 			}
 			access := ClassifyAccess(r)
@@ -504,13 +621,20 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 			if !match {
 				continue
 			}
-			if procFilter != "" && r.EnclosingProc != procFilter {
+			// Module-scope refs (no enclosing PROC) get a synthetic key
+			// so polydraw-style setup blocks still cluster. Marker is
+			// distinguishable from real PROC names by the colon.
+			procKey := r.EnclosingProc
+			if procKey == "" {
+				procKey = ModuleScopeProcKey(r.File)
+			}
+			if procFilter != "" && procKey != procFilter {
 				continue
 			}
-			if procVars[r.EnclosingProc] == nil {
-				procVars[r.EnclosingProc] = map[string]bool{}
+			if procVars[procKey] == nil {
+				procVars[procKey] = map[string]bool{}
 			}
-			procVars[r.EnclosingProc][varName] = true
+			procVars[procKey][varName] = true
 		}
 	}
 

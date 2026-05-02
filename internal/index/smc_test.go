@@ -203,6 +203,96 @@ func TestSmcClustersByProc(t *testing.T) {
 	}
 }
 
+// fixtureWithModuleScopeWrites adds two SMC vars whose writers have
+// no enclosing PROC (mirroring the polydraw.inc setup-block case).
+func fixtureWithModuleScopeWrites() *Index {
+	idx := buildSmcFixture()
+	// Two new vars under a new file.
+	pdFile := "polydraw.inc"
+	idx.Files[pdFile] = &source.File{Path: pdFile, Lines: []string{"; setup"}}
+	idx.Symbols["SmcAnchor_bfdd"] = []*SymbolEntry{{
+		Name: "SmcAnchor_bfdd", Kind: "export", File: pdFile, Line: 7,
+		Addr: 0xbfdd, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_bfdf"] = []*SymbolEntry{{
+		Name: "Var_bfdf", Kind: "EQU", File: "globals.inc", Line: 500,
+		Text: "word ptr SmcAnchor_bfdd + 2",
+	}}
+	idx.Symbols["SmcAnchor_bfe1"] = []*SymbolEntry{{
+		Name: "SmcAnchor_bfe1", Kind: "export", File: pdFile, Line: 9,
+		Addr: 0xbfe1, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_bfe3"] = []*SymbolEntry{{
+		Name: "Var_bfe3", Kind: "EQU", File: "globals.inc", Line: 501,
+		Text: "word ptr SmcAnchor_bfe1 + 2",
+	}}
+	// Module-scope writes (no EnclosingProc).
+	idx.Refs["Var_bfdf"] = []*RefEntry{{
+		Target: "Var_bfdf", Kind: "mem",
+		File: pdFile, Line: 7,
+		EnclosingProc: "", // module scope
+		Text:          "mov [Var_bfdf], ax",
+	}}
+	idx.Refs["Var_bfe3"] = []*RefEntry{{
+		Target: "Var_bfe3", Kind: "mem",
+		File: pdFile, Line: 9,
+		EnclosingProc: "",
+		Text:          "mov [Var_bfe3], cx",
+	}}
+	return idx
+}
+
+func TestSmcClustersByProc_ModuleScopeSyntheticKey(t *testing.T) {
+	idx := fixtureWithModuleScopeWrites()
+	clusters := idx.SmcClustersByProc("writer_proc", "", 2)
+	// Should include the FlightModelUpdate cluster AND a synthetic
+	// polydraw.inc:module-scope cluster of size 2.
+	wantKey := ModuleScopeProcKey("polydraw.inc")
+	found := false
+	for _, c := range clusters {
+		if c.Proc == wantKey {
+			found = true
+			if len(c.Vars) != 2 {
+				t.Errorf("module-scope cluster size: %d, want 2", len(c.Vars))
+			}
+		}
+	}
+	if !found {
+		got := make([]string, 0, len(clusters))
+		for _, c := range clusters {
+			got = append(got, c.Proc)
+		}
+		t.Errorf("synthetic module-scope key %q not found; clusters: %v", wantKey, got)
+	}
+	// The proc filter accepts the synthetic name.
+	filtered := idx.SmcClustersByProc("writer_proc", wantKey, 2)
+	if len(filtered) != 1 || filtered[0].Proc != wantKey {
+		t.Errorf("filter on synthetic key returned: %+v", filtered)
+	}
+}
+
+func TestSmcClustersByFile(t *testing.T) {
+	idx := fixtureWithModuleScopeWrites()
+	clusters := idx.SmcClustersByFile("writer_file", "", 2)
+	// Two writer-file clusters: main.inc (FlightModelUpdate's vars) and
+	// polydraw.inc (module-scope vars).
+	got := map[string]int{}
+	for _, c := range clusters {
+		got[c.Proc] = len(c.Vars)
+	}
+	if got["polydraw.inc"] != 2 {
+		t.Errorf("polydraw.inc cluster size: %d, want 2 (got: %v)", got["polydraw.inc"], got)
+	}
+	if got["main.inc"] != 2 {
+		t.Errorf("main.inc cluster size: %d, want 2 (got: %v)", got["main.inc"], got)
+	}
+	// fileFilter narrows.
+	filtered := idx.SmcClustersByFile("writer_file", "polydraw.inc", 2)
+	if len(filtered) != 1 || filtered[0].Proc != "polydraw.inc" {
+		t.Errorf("filter on polydraw.inc returned: %+v", filtered)
+	}
+}
+
 // buildSmcFixture returns a tiny index pre-populated with three anchors and
 // their var aliases, mimicking the FlightModelUpdate triple
 // (Var_a81b/a81e/a824 → SmcAnchor_a81a/a81d/a822). The fixture deliberately
