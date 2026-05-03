@@ -180,7 +180,7 @@ func TestSmcClustersByProc(t *testing.T) {
 	idx := buildSmcFixture()
 	// buildSmcFixture has FlightModelUpdate writing Var_a81b and Var_a81e.
 	// Both should land in one writer cluster of size 2.
-	clusters := idx.SmcClustersByProc("writer_proc", "", 2)
+	clusters := idx.SmcClustersByProc("writer_proc", "", 2, 0)
 	if len(clusters) != 1 {
 		t.Fatalf("got %d clusters, want 1: %+v", len(clusters), clusters)
 	}
@@ -194,11 +194,11 @@ func TestSmcClustersByProc(t *testing.T) {
 		t.Errorf("role: %q", clusters[0].Role)
 	}
 	// Reader query yields nothing here -- the fixture has no reader refs.
-	if r := idx.SmcClustersByProc("reader_proc", "", 2); len(r) != 0 {
+	if r := idx.SmcClustersByProc("reader_proc", "", 2, 0); len(r) != 0 {
 		t.Errorf("reader clusters: %d", len(r))
 	}
 	// proc filter narrows correctly.
-	if r := idx.SmcClustersByProc("writer_proc", "OtherProc", 2); len(r) != 0 {
+	if r := idx.SmcClustersByProc("writer_proc", "OtherProc", 2, 0); len(r) != 0 {
 		t.Errorf("filter narrowed to OtherProc but got %d", len(r))
 	}
 }
@@ -244,7 +244,7 @@ func fixtureWithModuleScopeWrites() *Index {
 
 func TestSmcClustersByProc_ModuleScopeSyntheticKey(t *testing.T) {
 	idx := fixtureWithModuleScopeWrites()
-	clusters := idx.SmcClustersByProc("writer_proc", "", 2)
+	clusters := idx.SmcClustersByProc("writer_proc", "", 2, 0)
 	// Should include the FlightModelUpdate cluster AND a synthetic
 	// polydraw.inc:module-scope cluster of size 2.
 	wantKey := ModuleScopeProcKey("polydraw.inc")
@@ -265,15 +265,83 @@ func TestSmcClustersByProc_ModuleScopeSyntheticKey(t *testing.T) {
 		t.Errorf("synthetic module-scope key %q not found; clusters: %v", wantKey, got)
 	}
 	// The proc filter accepts the synthetic name.
-	filtered := idx.SmcClustersByProc("writer_proc", wantKey, 2)
+	filtered := idx.SmcClustersByProc("writer_proc", wantKey, 2, 0)
 	if len(filtered) != 1 || filtered[0].Proc != wantKey {
 		t.Errorf("filter on synthetic key returned: %+v", filtered)
 	}
 }
 
+func TestSmcClustersByFile_SubClusters(t *testing.T) {
+	// Build a fixture where four vars in one file have writers split
+	// across two source-line bands: 100/102 (motion-delta-style pair)
+	// and 500/505 (timer-style pair).
+	idx := buildSmcFixture()
+	pdFile := "perframe.inc"
+	idx.Files[pdFile] = &source.File{Path: pdFile, Lines: []string{"; perframe"}}
+	addPair := func(anchorName, varName string, addr uint32, slotOff int, writerLine int) {
+		idx.Symbols[anchorName] = []*SymbolEntry{{
+			Name: anchorName, Kind: "export", File: pdFile, Line: writerLine,
+			Addr: addr, HasAddr: true, Segment: "CSEG",
+		}}
+		idx.Symbols[varName] = []*SymbolEntry{{
+			Name: varName, Kind: "EQU", File: "globals.inc", Line: 100,
+			Text: "word ptr " + anchorName + " + " + itoa(slotOff),
+		}}
+		idx.Refs[varName] = []*RefEntry{{
+			Target: varName, Kind: "mem",
+			File: pdFile, Line: writerLine,
+			EnclosingProc: "PerFrameUpdate",
+			Text:          "mov [" + varName + "], ax",
+		}}
+	}
+	addPair("SmcAnchor_3000", "Var_3001", 0x3000, 1, 100)
+	addPair("SmcAnchor_3010", "Var_3011", 0x3010, 1, 102)
+	addPair("SmcAnchor_4000", "Var_4001", 0x4000, 1, 500)
+	addPair("SmcAnchor_4010", "Var_4011", 0x4010, 1, 505)
+
+	clusters := idx.SmcClustersByFile("writer_file", "perframe.inc", 2, 25)
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1", len(clusters))
+	}
+	c := clusters[0]
+	if len(c.Vars) != 4 {
+		t.Errorf("cluster size: %d, want 4", len(c.Vars))
+	}
+	if len(c.SubClusters) != 2 {
+		t.Fatalf("got %d sub-clusters, want 2: %+v", len(c.SubClusters), c.SubClusters)
+	}
+	// First sub-cluster: lines 100..102.
+	if c.SubClusters[0].LineStart != 100 || c.SubClusters[0].LineEnd != 102 {
+		t.Errorf("sub[0] lines: %d..%d", c.SubClusters[0].LineStart, c.SubClusters[0].LineEnd)
+	}
+	if len(c.SubClusters[0].Vars) != 2 {
+		t.Errorf("sub[0] var count: %d", len(c.SubClusters[0].Vars))
+	}
+	// Second sub-cluster: lines 500..505.
+	if c.SubClusters[1].LineStart != 500 || c.SubClusters[1].LineEnd != 505 {
+		t.Errorf("sub[1] lines: %d..%d", c.SubClusters[1].LineStart, c.SubClusters[1].LineEnd)
+	}
+
+	// With a wider gap (1000 lines), all 4 collapse into one sub-cluster --
+	// which is the "no useful split" case → SubClusters should be nil.
+	clusters = idx.SmcClustersByFile("writer_file", "perframe.inc", 2, 1000)
+	if len(clusters) != 1 {
+		t.Fatalf("wide-gap cluster count: %d", len(clusters))
+	}
+	if clusters[0].SubClusters != nil {
+		t.Errorf("expected nil SubClusters when only one would emerge; got %+v", clusters[0].SubClusters)
+	}
+
+	// With sub_max_line_gap=0 (disabled), no sub-clusters should be computed.
+	clusters = idx.SmcClustersByFile("writer_file", "perframe.inc", 2, 0)
+	if clusters[0].SubClusters != nil {
+		t.Errorf("expected nil SubClusters when disabled; got %+v", clusters[0].SubClusters)
+	}
+}
+
 func TestSmcClustersByFile(t *testing.T) {
 	idx := fixtureWithModuleScopeWrites()
-	clusters := idx.SmcClustersByFile("writer_file", "", 2)
+	clusters := idx.SmcClustersByFile("writer_file", "", 2, 0)
 	// Two writer-file clusters: main.inc (FlightModelUpdate's vars) and
 	// polydraw.inc (module-scope vars).
 	got := map[string]int{}
@@ -287,7 +355,7 @@ func TestSmcClustersByFile(t *testing.T) {
 		t.Errorf("main.inc cluster size: %d, want 2 (got: %v)", got["main.inc"], got)
 	}
 	// fileFilter narrows.
-	filtered := idx.SmcClustersByFile("writer_file", "polydraw.inc", 2)
+	filtered := idx.SmcClustersByFile("writer_file", "polydraw.inc", 2, 0)
 	if len(filtered) != 1 || filtered[0].Proc != "polydraw.inc" {
 		t.Errorf("filter on polydraw.inc returned: %+v", filtered)
 	}

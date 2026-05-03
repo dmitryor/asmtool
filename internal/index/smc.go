@@ -442,9 +442,23 @@ func slotSizeBytes(s string) int {
 // (8 matrix vars span ~150 source lines but a single reader PROC loads
 // them all back-to-back).
 type SmcProcCluster struct {
-	Proc    string         // the shared writer or reader PROC
-	Role    string         // "writer" | "reader"
-	Vars    []SmcAnchorRef // one entry per var the PROC touches; sorted by anchor address
+	Proc        string          // the shared writer or reader PROC
+	Role        string          // "writer" | "reader"
+	Vars        []SmcAnchorRef  // one entry per var the PROC touches; sorted by anchor address
+	SubClusters []SmcSubCluster // adjacency-grouped sub-clusters; nil when no split applies
+}
+
+// SmcSubCluster is a writer/reader-line-adjacent sub-grouping inside a
+// larger SmcProcCluster. The motivating case: perframe.inc writes 30 SMC
+// slots in one file, but those 30 fall into 4 tight sub-clusters
+// (motion-delta broadcast, SP-anchor pair, LOD-scale group, timer pair)
+// scattered across the file body. Grouping vars whose writer lines sit
+// within a few dozen lines of each other surfaces these sub-patterns
+// without the agent having to spot them visually.
+type SmcSubCluster struct {
+	LineStart int            // first writer/reader line in this sub-group
+	LineEnd   int            // last writer/reader line in this sub-group
+	Vars      []SmcAnchorRef // sorted by anchor address ascending
 }
 
 // ModuleScopeProcKey synthesizes a stable proc-name substitute for
@@ -467,8 +481,13 @@ func ModuleScopeProcKey(absPath string) string {
 // synthetic per-file pseudo-PROCs by-PROC mode would emit.
 //
 // Returns SmcProcCluster instances with the file basename in `Proc` and
-// `Role` set to "writer" or "reader".
-func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*SmcProcCluster {
+// `Role` set to "writer" or "reader". When `subMaxLineGap` > 0 each
+// cluster's `SubClusters` is populated from writer-line adjacency:
+// vars whose writer/reader source lines sit within `subMaxLineGap` of
+// each other share a sub-cluster. Use this to surface the 4-sub-cluster
+// shape of perframe.inc (motion-delta broadcast, SP-anchor pair,
+// LOD-scale group, timer pair) without visual scanning.
+func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize, subMaxLineGap int) []*SmcProcCluster {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if minSize < 1 {
@@ -503,6 +522,9 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*Smc
 	}
 
 	fileVars := map[string]map[string]bool{}
+	// Per-file, per-var: lowest matching ref line. Used to seed the
+	// adjacency-based sub-cluster pass after primary grouping.
+	firstLine := map[string]map[string]int{}
 	for varName := range varRefs {
 		for _, r := range idx.Refs[varName] {
 			if r.Kind != "mem" {
@@ -528,8 +550,12 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*Smc
 			}
 			if fileVars[base] == nil {
 				fileVars[base] = map[string]bool{}
+				firstLine[base] = map[string]int{}
 			}
 			fileVars[base][varName] = true
+			if cur := firstLine[base][varName]; cur == 0 || r.Line < cur {
+				firstLine[base][varName] = r.Line
+			}
 		}
 	}
 
@@ -553,6 +579,9 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*Smc
 		sort.Slice(c.Vars, func(i, j int) bool {
 			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
 		})
+		if subMaxLineGap > 0 && len(c.Vars) >= 3 {
+			c.SubClusters = subClusterByLine(c.Vars, firstLine[file], subMaxLineGap)
+		}
 		clusters = append(clusters, c)
 	}
 	sort.Slice(clusters, func(i, j int) bool {
@@ -567,8 +596,10 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize int) []*Smc
 // SmcClustersByProc returns clusters keyed by shared writer or reader
 // PROC. `kind` selects the access ("write" includes rw; "read" picks
 // up cmp/mov-from). `procFilter`, when non-empty, restricts output to a
-// single PROC. Clusters smaller than `minSize` are dropped.
-func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*SmcProcCluster {
+// single PROC. Clusters smaller than `minSize` are dropped. When
+// `subMaxLineGap` > 0, each cluster's `SubClusters` is populated from
+// writer/reader-line adjacency (same logic as SmcClustersByFile).
+func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize, subMaxLineGap int) []*SmcProcCluster {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if minSize < 1 {
@@ -605,6 +636,7 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 
 	// proc -> []var name (ordered by addr later)
 	procVars := map[string]map[string]bool{}
+	procVarFirstLine := map[string]map[string]int{}
 	for varName := range varRefs {
 		for _, r := range idx.Refs[varName] {
 			if r.Kind != "mem" {
@@ -633,8 +665,12 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 			}
 			if procVars[procKey] == nil {
 				procVars[procKey] = map[string]bool{}
+				procVarFirstLine[procKey] = map[string]int{}
 			}
 			procVars[procKey][varName] = true
+			if cur := procVarFirstLine[procKey][varName]; cur == 0 || r.Line < cur {
+				procVarFirstLine[procKey][varName] = r.Line
+			}
 		}
 	}
 
@@ -659,6 +695,9 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 		sort.Slice(c.Vars, func(i, j int) bool {
 			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
 		})
+		if subMaxLineGap > 0 && len(c.Vars) >= 3 {
+			c.SubClusters = subClusterByLine(c.Vars, procVarFirstLine[proc], subMaxLineGap)
+		}
 		clusters = append(clusters, c)
 	}
 	// Sort: largest cluster first; tiebreak by proc name.
@@ -669,6 +708,66 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize int) []*Smc
 		return clusters[i].Proc < clusters[j].Proc
 	})
 	return clusters
+}
+
+// subClusterByLine partitions a cluster's vars into sub-clusters by
+// adjacency on their writer/reader source line. Vars are sorted by their
+// recorded `firstLine` value; a gap > maxGap starts a new sub-cluster.
+// Returns nil when fewer than 2 sub-clusters would result -- callers
+// don't want a single sub-cluster echoing the parent.
+func subClusterByLine(vars []SmcAnchorRef, firstLine map[string]int, maxGap int) []SmcSubCluster {
+	if len(vars) == 0 {
+		return nil
+	}
+	type rec struct {
+		line int
+		ref  SmcAnchorRef
+	}
+	rows := make([]rec, 0, len(vars))
+	for _, v := range vars {
+		ln := 0
+		if v.Var != nil {
+			ln = firstLine[v.Var.Name]
+		}
+		rows = append(rows, rec{line: ln, ref: v})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].line < rows[j].line
+	})
+	var groups []SmcSubCluster
+	cur := SmcSubCluster{}
+	prevLine := -1
+	for _, r := range rows {
+		if r.line == 0 {
+			// Skip vars with no scope-matching ref line (shouldn't happen
+			// in practice -- the cluster builder already required a match).
+			continue
+		}
+		startNew := len(cur.Vars) == 0 || (r.line-prevLine) > maxGap
+		if startNew {
+			if len(cur.Vars) > 0 {
+				groups = append(groups, cur)
+			}
+			cur = SmcSubCluster{LineStart: r.line, LineEnd: r.line}
+		}
+		cur.Vars = append(cur.Vars, r.ref)
+		cur.LineEnd = r.line
+		prevLine = r.line
+	}
+	if len(cur.Vars) > 0 {
+		groups = append(groups, cur)
+	}
+	if len(groups) < 2 {
+		// One sub-cluster equal to the parent isn't useful structure.
+		return nil
+	}
+	// Sort vars inside each sub-cluster by anchor addr for stable display.
+	for i := range groups {
+		sort.Slice(groups[i].Vars, func(a, b int) bool {
+			return groups[i].Vars[a].Anchor.Addr < groups[i].Vars[b].Anchor.Addr
+		})
+	}
+	return groups
 }
 
 // hostInstructionLocked is HostInstruction without taking the lock again

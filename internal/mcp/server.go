@@ -235,6 +235,8 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 			mcp.Description("Minimum cluster size -- singletons are usually noise (default 2)")),
 		mcp.WithNumber("limit",
 			mcp.Description("Max clusters to return (default 50)")),
+		mcp.WithNumber("sub_max_line_gap",
+			mcp.Description("With by=writer_*/reader_*: gap (in source lines) below which adjacent writer/reader sites are sub-grouped. Default 25; 0 disables sub-clustering. Surfaces the 4-sub-cluster shape of e.g. perframe.inc (motion-delta broadcast, SP-anchor pair, LOD-scale group, timer pair) inside what would otherwise be a single 30-var blob.")),
 	), s.handleSmcClusters)
 
 	srv.AddTool(mcp.NewTool("smc_var_info",
@@ -1012,12 +1014,16 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 		if by == "reader_proc" || by == "reader" || by == "reader_file" {
 			role = "reader"
 		}
+		subMaxLineGap := int(req.GetFloat("sub_max_line_gap", 25))
+		if subMaxLineGap < 0 {
+			subMaxLineGap = 0
+		}
 		var procClusters []*index.SmcProcCluster
 		switch by {
 		case "writer_file", "reader_file":
-			procClusters = idx.SmcClustersByFile(by, fileFilter, minSize)
+			procClusters = idx.SmcClustersByFile(by, fileFilter, minSize, subMaxLineGap)
 		default:
-			procClusters = idx.SmcClustersByProc(by, procFilter, minSize)
+			procClusters = idx.SmcClustersByProc(by, procFilter, minSize, subMaxLineGap)
 		}
 		total := len(procClusters)
 		if len(procClusters) > limit {
@@ -1047,6 +1053,28 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 				"role":      c.Role,
 				"var_count": len(c.Vars),
 				"vars":      vars,
+			}
+			if len(c.SubClusters) > 0 {
+				subs := make([]map[string]any, 0, len(c.SubClusters))
+				for _, sc := range c.SubClusters {
+					subVars := make([]map[string]any, 0, len(sc.Vars))
+					for _, v := range sc.Vars {
+						subVars = append(subVars, map[string]any{
+							"var":    v.Var.Name,
+							"anchor": v.Anchor.Name,
+							"addr":   fmt.Sprintf("0x%04x", v.Anchor.Addr),
+							"slot":   map[string]any{"size": v.Slot.Size, "offset": v.Slot.Offset},
+						})
+					}
+					subs = append(subs, map[string]any{
+						"line_start": sc.LineStart,
+						"line_end":   sc.LineEnd,
+						"var_count":  len(sc.Vars),
+						"vars":       subVars,
+					})
+				}
+				entry["sub_clusters"] = subs
+				entry["sub_cluster_count"] = len(subs)
 			}
 			out = append(out, entry)
 		}

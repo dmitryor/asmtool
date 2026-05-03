@@ -74,6 +74,12 @@ Composite:
     grouping. Right shape for module-scope setup blocks (e.g.
     polydraw.inc's 18 SMC slots all written at file scope without
     a PROC wrapper).
+  When `by` is one of the writer/reader modes, each cluster also
+  surfaces `sub_clusters` keyed on writer/reader-line adjacency
+  (default gap 25 lines, configurable via `sub_max_line_gap`).
+  Splits a 30-var perframe.inc cluster into its 4 natural
+  sub-groups (motion-delta broadcast, SP-anchor pair, LOD-scale
+  group, timer pair) without visual scanning.
 - `unresolved(kind, limit)` — scaffolding backlog ranked by reference count;
   `kind` ∈ `procs` (default), `data`, `all`
 
