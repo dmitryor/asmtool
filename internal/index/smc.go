@@ -763,46 +763,73 @@ func ModuleScopeProcKey(absPath string) string {
 // `Role` set to "writer" or "reader". When `subMaxLineGap` > 0 each
 // cluster's `SubClusters` is populated from writer-line adjacency:
 // vars whose writer/reader source lines sit within `subMaxLineGap` of
-// each other share a sub-cluster. Use this to surface the 4-sub-cluster
-// shape of perframe.inc (motion-delta broadcast, SP-anchor pair,
-// LOD-scale group, timer pair) without visual scanning.
+// each other share a sub-cluster.
 func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize, subMaxLineGap int) []*SmcProcCluster {
+	keyFn := func(r *RefEntry) string {
+		base := r.File
+		if i := strings.LastIndexAny(r.File, "/\\"); i >= 0 {
+			base = r.File[i+1:]
+		}
+		return base
+	}
+	keyFilter := fileFilter
+	if keyFilter != "" && strings.ContainsAny(keyFilter, "/\\") {
+		// Allow callers to pass an absolute path; reduce to basename so
+		// the keyFn output matches.
+		if i := strings.LastIndexAny(keyFilter, "/\\"); i >= 0 {
+			keyFilter = keyFilter[i+1:]
+		}
+	}
+	return idx.smcClustersByKey(kind, keyFn, keyFilter, minSize, subMaxLineGap)
+}
+
+// SmcClustersByProc returns clusters keyed by shared writer or reader
+// PROC. Module-scope refs (no enclosing PROC) cluster under the
+// synthetic key `<basename>:module-scope` so polydraw-style setup
+// blocks still surface. Filtering on that synthetic key works the same
+// way as filtering on a real PROC name.
+func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize, subMaxLineGap int) []*SmcProcCluster {
+	keyFn := func(r *RefEntry) string {
+		if r.EnclosingProc == "" {
+			return ModuleScopeProcKey(r.File)
+		}
+		return r.EnclosingProc
+	}
+	return idx.smcClustersByKey(kind, keyFn, procFilter, minSize, subMaxLineGap)
+}
+
+// smcClustersByKey is the shared implementation behind SmcClustersByFile
+// and SmcClustersByProc. The two callers differ only in how they map a
+// matching ref to a cluster key (basename vs. enclosing PROC), so
+// keyFn is the only knob that varies.
+func (idx *Index) smcClustersByKey(
+	kind string,
+	keyFn func(*RefEntry) string,
+	keyFilter string,
+	minSize, subMaxLineGap int,
+) []*SmcProcCluster {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if minSize < 1 {
 		minSize = 2
 	}
-
-	varRefs := map[string]SmcAnchorRef{}
-	for name, decls := range idx.Symbols {
-		if !strings.HasPrefix(name, "Var_") {
-			continue
-		}
-		for _, s := range decls {
-			if s.Kind != "EQU" || s.Text == "" {
-				continue
-			}
-			slot, ok := ParseSmcEqu(s.Text)
-			if !ok {
-				continue
-			}
-			anchorDecls := idx.Symbols[slot.Anchor]
-			if len(anchorDecls) == 0 {
-				continue
-			}
-			anchor := anchorDecls[0]
-			varRefs[name] = SmcAnchorRef{
-				Anchor:    anchor,
-				Var:       s,
-				Slot:      slot,
-				HostInstr: idx.hostInstructionLocked(anchor),
-			}
-		}
+	wantWrite := false
+	wantRead := false
+	switch kind {
+	case "writer", "writer_proc", "writer_file", "write":
+		wantWrite = true
+	case "reader", "reader_proc", "reader_file", "read":
+		wantRead = true
+	}
+	role := "writer"
+	if wantRead {
+		role = "reader"
 	}
 
-	fileVars := map[string]map[string]bool{}
-	// Per-file, per-var: lowest matching ref line. Used to seed the
-	// adjacency-based sub-cluster pass after primary grouping.
+	varRefs := idx.buildVarRefsLocked()
+
+	// key -> set of var names; key -> per-var lowest matching line.
+	bucket := map[string]map[string]bool{}
 	firstLine := map[string]map[string]int{}
 	for varName := range varRefs {
 		for _, r := range idx.Refs[varName] {
@@ -810,56 +837,42 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize, subMaxLine
 				continue
 			}
 			access := ClassifyAccess(r)
-			match := false
-			switch kind {
-			case "writer", "writer_file", "write":
-				match = access == "write" || access == "rw"
-			case "reader", "reader_file", "read":
-				match = access == "read" || access == "rw"
-			}
+			match := (wantWrite && (access == "write" || access == "rw")) ||
+				(wantRead && (access == "read" || access == "rw"))
 			if !match {
 				continue
 			}
-			base := r.File
-			if i := strings.LastIndexAny(r.File, "/\\"); i >= 0 {
-				base = r.File[i+1:]
-			}
-			if fileFilter != "" && base != fileFilter && r.File != fileFilter {
+			key := keyFn(r)
+			if keyFilter != "" && key != keyFilter {
 				continue
 			}
-			if fileVars[base] == nil {
-				fileVars[base] = map[string]bool{}
-				firstLine[base] = map[string]int{}
+			if bucket[key] == nil {
+				bucket[key] = map[string]bool{}
+				firstLine[key] = map[string]int{}
 			}
-			fileVars[base][varName] = true
-			if cur := firstLine[base][varName]; cur == 0 || r.Line < cur {
-				firstLine[base][varName] = r.Line
+			bucket[key][varName] = true
+			if cur := firstLine[key][varName]; cur == 0 || r.Line < cur {
+				firstLine[key][varName] = r.Line
 			}
 		}
 	}
 
-	role := "writer"
-	if kind == "reader" || kind == "reader_file" || kind == "read" {
-		role = "reader"
-	}
-	clusters := make([]*SmcProcCluster, 0, len(fileVars))
-	for file, varSet := range fileVars {
+	clusters := make([]*SmcProcCluster, 0, len(bucket))
+	for key, varSet := range bucket {
 		if len(varSet) < minSize {
 			continue
 		}
-		c := &SmcProcCluster{Proc: file, Role: role}
+		c := &SmcProcCluster{Proc: key, Role: role}
 		for v := range varSet {
-			ref, ok := varRefs[v]
-			if !ok {
-				continue
+			if ref, ok := varRefs[v]; ok {
+				c.Vars = append(c.Vars, ref)
 			}
-			c.Vars = append(c.Vars, ref)
 		}
 		sort.Slice(c.Vars, func(i, j int) bool {
 			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
 		})
 		if subMaxLineGap > 0 && len(c.Vars) >= 3 {
-			c.SubClusters = subClusterByLine(c.Vars, firstLine[file], subMaxLineGap)
+			c.SubClusters = subClusterByLine(c.Vars, firstLine[key], subMaxLineGap)
 		}
 		clusters = append(clusters, c)
 	}
@@ -872,21 +885,11 @@ func (idx *Index) SmcClustersByFile(kind, fileFilter string, minSize, subMaxLine
 	return clusters
 }
 
-// SmcClustersByProc returns clusters keyed by shared writer or reader
-// PROC. `kind` selects the access ("write" includes rw; "read" picks
-// up cmp/mov-from). `procFilter`, when non-empty, restricts output to a
-// single PROC. Clusters smaller than `minSize` are dropped. When
-// `subMaxLineGap` > 0, each cluster's `SubClusters` is populated from
-// writer/reader-line adjacency (same logic as SmcClustersByFile).
-func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize, subMaxLineGap int) []*SmcProcCluster {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	if minSize < 1 {
-		minSize = 2
-	}
-
-	// Map var name -> SmcAnchorRef (anchor + slot + host instr).
-	varRefs := map[string]SmcAnchorRef{}
+// buildVarRefsLocked walks every Var_* EQU and pre-computes the
+// SmcAnchorRef record (anchor + slot + host instruction) used by the
+// cluster scans. Caller must hold idx.mu.RLock.
+func (idx *Index) buildVarRefsLocked() map[string]SmcAnchorRef {
+	out := map[string]SmcAnchorRef{}
 	for name, decls := range idx.Symbols {
 		if !strings.HasPrefix(name, "Var_") {
 			continue
@@ -904,7 +907,7 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize, subMaxLine
 				continue
 			}
 			anchor := anchorDecls[0]
-			varRefs[name] = SmcAnchorRef{
+			out[name] = SmcAnchorRef{
 				Anchor:    anchor,
 				Var:       s,
 				Slot:      slot,
@@ -912,81 +915,7 @@ func (idx *Index) SmcClustersByProc(kind, procFilter string, minSize, subMaxLine
 			}
 		}
 	}
-
-	// proc -> []var name (ordered by addr later)
-	procVars := map[string]map[string]bool{}
-	procVarFirstLine := map[string]map[string]int{}
-	for varName := range varRefs {
-		for _, r := range idx.Refs[varName] {
-			if r.Kind != "mem" {
-				continue
-			}
-			access := ClassifyAccess(r)
-			match := false
-			switch kind {
-			case "writer", "writer_proc", "write":
-				match = access == "write" || access == "rw"
-			case "reader", "reader_proc", "read":
-				match = access == "read" || access == "rw"
-			}
-			if !match {
-				continue
-			}
-			// Module-scope refs (no enclosing PROC) get a synthetic key
-			// so polydraw-style setup blocks still cluster. Marker is
-			// distinguishable from real PROC names by the colon.
-			procKey := r.EnclosingProc
-			if procKey == "" {
-				procKey = ModuleScopeProcKey(r.File)
-			}
-			if procFilter != "" && procKey != procFilter {
-				continue
-			}
-			if procVars[procKey] == nil {
-				procVars[procKey] = map[string]bool{}
-				procVarFirstLine[procKey] = map[string]int{}
-			}
-			procVars[procKey][varName] = true
-			if cur := procVarFirstLine[procKey][varName]; cur == 0 || r.Line < cur {
-				procVarFirstLine[procKey][varName] = r.Line
-			}
-		}
-	}
-
-	role := "writer"
-	if kind == "reader" || kind == "reader_proc" || kind == "read" {
-		role = "reader"
-	}
-
-	clusters := make([]*SmcProcCluster, 0, len(procVars))
-	for proc, varSet := range procVars {
-		if len(varSet) < minSize {
-			continue
-		}
-		c := &SmcProcCluster{Proc: proc, Role: role}
-		for v := range varSet {
-			ref, ok := varRefs[v]
-			if !ok {
-				continue
-			}
-			c.Vars = append(c.Vars, ref)
-		}
-		sort.Slice(c.Vars, func(i, j int) bool {
-			return c.Vars[i].Anchor.Addr < c.Vars[j].Anchor.Addr
-		})
-		if subMaxLineGap > 0 && len(c.Vars) >= 3 {
-			c.SubClusters = subClusterByLine(c.Vars, procVarFirstLine[proc], subMaxLineGap)
-		}
-		clusters = append(clusters, c)
-	}
-	// Sort: largest cluster first; tiebreak by proc name.
-	sort.Slice(clusters, func(i, j int) bool {
-		if len(clusters[i].Vars) != len(clusters[j].Vars) {
-			return len(clusters[i].Vars) > len(clusters[j].Vars)
-		}
-		return clusters[i].Proc < clusters[j].Proc
-	})
-	return clusters
+	return out
 }
 
 // subClusterByLine partitions a cluster's vars into sub-clusters by
