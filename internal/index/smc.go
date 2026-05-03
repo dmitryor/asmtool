@@ -468,26 +468,14 @@ func (idx *Index) instructionBeforeLocked(addr uint32) *jwasm.Instruction {
 }
 
 func firstToken(text string) string {
-	s := strings.TrimSpace(text)
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		first := s[:i]
-		if strings.HasSuffix(first, ":") {
-			s = strings.TrimSpace(s[i:])
-		}
-	}
-	i := 0
-	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
-		i++
-	}
-	tok := strings.ToLower(s[:i])
-	// Encoding-macro fallback (matches role.go's behaviour).
-	if u := strings.IndexByte(tok, '_'); u > 0 {
-		prefix := tok[:u]
+	mnem, _, _ := splitOperands(text)
+	if u := strings.IndexByte(mnem, '_'); u > 0 {
+		prefix := mnem[:u]
 		if isLowMnemonic(prefix) || isHighMnemonic(prefix) {
 			return prefix
 		}
 	}
-	return tok
+	return mnem
 }
 
 func isLowMnemonic(m string) bool {
@@ -716,28 +704,12 @@ func (idx *Index) FindMirrorWrites(proc string, maxLineGap, minSize int) []Mirro
 // source operand is itself a memory operand (not a register/imm value
 // being broadcast).
 func extractWriteSource(text string) string {
-	s := strings.TrimSpace(text)
-	// Strip leading label.
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		first := s[:i]
-		if strings.HasSuffix(first, ":") {
-			s = strings.TrimSpace(s[i:])
-		}
-	}
-	// Skip mnemonic.
-	i := 0
-	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
-		i++
-	}
-	rest := strings.TrimSpace(s[i:])
-	c := indexTopComma(rest)
-	if c < 0 {
+	_, _, src := splitOperands(text)
+	if src == "" {
 		return ""
 	}
-	src := strings.TrimSpace(rest[c+1:])
-	// Strip trailing inline comment if any survived.
-	if idx := strings.IndexByte(src, ';'); idx >= 0 {
-		src = strings.TrimSpace(src[:idx])
+	if i := strings.IndexByte(src, ';'); i >= 0 {
+		src = strings.TrimSpace(src[:i])
 	}
 	return strings.ToLower(src)
 }

@@ -25,43 +25,19 @@ import "strings"
 //	data_filler       -- db/dw/dd <values>
 //	jump_target       -- jmp/call/j<cond> <imm>    (rare for SMC slots)
 func ClassifyHostRole(text string) string {
-	s := strings.TrimSpace(text)
-	// Drop a leading label like "Foo:" or "Foo::".
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		first := s[:i]
-		if strings.HasSuffix(first, ":") {
-			s = strings.TrimSpace(s[i:])
-		}
+	mnem, dst, _ := splitOperands(text)
+	if mnem == "" {
+		return ""
 	}
-	// Mnemonic = first whitespace-delimited token.
-	i := 0
-	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
-		i++
-	}
-	mnem := strings.ToLower(s[:i])
-	rest := strings.TrimSpace(s[i:])
-
 	// Encoding-macro fallback: this codebase uses macros like
 	// `cmp_ax_imm16_long`, `mov_bh_bx_disp16`, `or_bx_imm16_long` that
 	// force a specific JWasm encoding for the underlying opcode. The
 	// macro name's underscore-prefix is the actual mnemonic, so we
-	// re-key on it when the full token isn't a known mnemonic. Without
-	// this, every patched cmp/mov inside an encoding macro would lose
-	// its role tag.
+	// re-key on it when the full token isn't a known mnemonic.
 	if !mnemonicHasRule(mnem) {
 		if u := strings.IndexByte(mnem, '_'); u > 0 && mnemonicHasRule(mnem[:u]) {
 			mnem = mnem[:u]
 		}
-	}
-
-	// Destination operand = text before the first top-level comma. We don't
-	// need to walk brackets perfectly here -- the dst-vs-src split for the
-	// patterns we care about is unambiguous in the codebase.
-	var dst string
-	if c := indexTopComma(rest); c >= 0 {
-		dst = strings.TrimSpace(rest[:c])
-	} else {
-		dst = rest
 	}
 	dstLow := strings.ToLower(dst)
 	dstIsMem := strings.HasPrefix(dstLow, "[") ||
@@ -124,23 +100,3 @@ func mnemonicHasRule(m string) bool {
 	return false
 }
 
-// indexTopComma returns the index of the first comma at bracket depth 0,
-// or -1.
-func indexTopComma(s string) int {
-	depth := 0
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '[', '(':
-			depth++
-		case ']', ')':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				return i
-			}
-		}
-	}
-	return -1
-}
