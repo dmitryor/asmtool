@@ -159,6 +159,16 @@ func classifyHeader(lines []string, p *ProcEntry) ProcHeaderCard {
 		}
 	}
 	if len(body) == 1 {
+		// Placeholder-TODO one-liners are reclassified as legacy_banner so
+		// the quality audit treats them as a violation that must be
+		// migrated to a real header card.
+		stripped := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(body[0]), ";"))
+		if isPlaceholderTodo(stripped) {
+			card.HeaderKind = HeaderLegacyBanner
+			card.Issues = append(card.Issues,
+				"placeholder TODO comment -- migrate to structured card")
+			return card
+		}
 		card.HeaderKind = HeaderOneLiner
 		return card
 	}
@@ -523,7 +533,41 @@ func isSubstantiveComment(c string) bool {
 			return false
 		}
 	}
+	if isPlaceholderTodo(strings.TrimSpace(c)) {
+		return false
+	}
 	return true
+}
+
+// isPlaceholderTodo reports whether `c` (already stripped of any leading
+// `;` and trimmed) is a quality-lift placeholder banner that the audit
+// must NOT count as substantive coverage.
+//
+// Two shapes:
+//
+//  1. Exact: `<Name> -- TODO: describe this function[.]`
+//     This is the auto-generated stub from an earlier annotation pass --
+//     ~250-300 of these exist across src/*.inc.
+//
+//  2. Bare TODO/XXX/FIXME tokens with no specific question. A
+//     substantive TODO like "TODO: verify whether DX is preserved" still
+//     counts -- only generic placeholders are rejected.
+func isPlaceholderTodo(c string) bool {
+	switch c {
+	case "TODO", "XXX", "FIXME", "TODO: describe":
+		return true
+	}
+	fields := strings.Fields(c)
+	if len(fields) >= 6 &&
+		fields[1] == "--" &&
+		fields[2] == "TODO:" &&
+		fields[3] == "describe" &&
+		fields[4] == "this" &&
+		(fields[5] == "function." || fields[5] == "function") &&
+		len(fields) == 6 {
+		return true
+	}
+	return false
 }
 
 // lookupEquByValue scans EQU symbols for one whose Text resolves to a

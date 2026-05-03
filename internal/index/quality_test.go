@@ -145,6 +145,59 @@ func TestParseNumericLiteral(t *testing.T) {
 	}
 }
 
+func TestIsSubstantiveComment_PlaceholderTodos(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		// Substantive content -- still true
+		{"saturate ceiling", true},
+		{"TODO: verify whether DX is preserved across SubStep", true},
+		{"PROC for the missile-track update; called per-frame", true},
+		// Placeholder banner: exact pattern
+		{"FixedMul -- TODO: describe this function.", false},
+		{"FixedMul -- TODO: describe this function", false},
+		// Bare placeholder tokens
+		{"TODO", false},
+		{"XXX", false},
+		{"FIXME", false},
+		{"TODO: describe", false},
+		// Empty / verify-script artefacts (existing behaviour)
+		{"", false},
+		{"b234 c7 06 00 00", false},
+	}
+	for _, c := range cases {
+		got := isSubstantiveComment(c.in)
+		if got != c.want {
+			t.Errorf("%q: got %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestProcHeaderCardCoverage_PlaceholderOneLiner(t *testing.T) {
+	file := "x.inc"
+	lines := make([]string, 12)
+	lines[5] = "; FixedMul -- TODO: describe this function."
+	lines[6] = "FixedMul PROC NEAR"
+	lines[7] = "    ret"
+	lines[8] = "FixedMul ENDP"
+	idx := &Index{
+		Files: map[string]*source.File{file: {Path: file, Lines: lines}},
+		Procs: map[string]*ProcEntry{
+			"FixedMul": {Name: "FixedMul", File: file, StartLine: 7, EndLine: 9},
+		},
+		Symbols: map[string][]*SymbolEntry{},
+		Refs:    map[string][]*RefEntry{},
+	}
+	cards := idx.ProcHeaderCardCoverage(file, "")
+	if len(cards) != 1 {
+		t.Fatalf("got %d cards, want 1", len(cards))
+	}
+	if cards[0].HeaderKind != HeaderLegacyBanner {
+		t.Errorf("placeholder one-liner should be legacy_banner; got %+v", cards[0])
+	}
+}
+
 func TestIsSelfEvidentBitPattern(t *testing.T) {
 	for _, v := range []uint64{0xFFFF, 0x8000, 0x8080, 0x7FFF, 0x000F, 0xF000, 0xFF00, 0x00FF} {
 		if !isSelfEvidentBitPattern(v) {
