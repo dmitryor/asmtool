@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__jwasm__find_data_refs",
+      "mcp__jwasm__find_symbol",
+      "mcp__jwasm__find_callees",
+      "mcp__jwasm__addr_to_location",
+      "mcp__jwasm__smc_var_info",
+      "mcp__jwasm__which_proc",
+      "mcp__jwasm__module_layout",
+      "mcp__jwasm__unresolved",
+      "mcp__jwasm__function_context",
+      "mcp__ghidra__get_function_by_address",
+      "mcp__ghidra__get_eol_comment",
+      "mcp__ghidra__get_pre_comment"
+    ]
+  }
+}

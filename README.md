@@ -54,6 +54,20 @@ Read-only navigation:
   the entry for `name` merged with live SMC slot metadata. The
   rename-phase companion to `rename_symbol`.
 
+Quality-audit primitives (consumed by `quality_audit.py`):
+
+- `proc_spacing(file)` — blank-line counts between consecutive
+  ENDP→PROC pairs (criterion 10).
+- `proc_header_card_coverage(file, proc?)` — classify each PROC's
+  preamble as `structured` / `one_liner` / `legacy_banner` /
+  `missing` (criterion 4).
+- `magic_immediate_scan(file, proc?, min_value?)` — every immediate
+  ≥ `min_value` (default 0x100) with annotation status, EQU match,
+  and excluded-class reasoning (criterion 5).
+- `xref_coverage(file, proc?, kinds?)` — call/jmp/mem_read/mem_write
+  xrefs with inline-annotation status and an external-doc lookup
+  over `doc/fn_*.md` and `doc/modules/*.md` (criterion 6).
+
 Composite:
 
 - `function_context(name)` — body + callers (with surrounding lines) +

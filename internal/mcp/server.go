@@ -222,6 +222,38 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 			mcp.Description("Byte range to cover (default 1 -- byte query)")),
 	), s.handleDataRefsAt)
 
+	srv.AddTool(mcp.NewTool("proc_spacing",
+		mcp.WithDescription("Quality-audit primitive (criterion 10). Returns one record per consecutive ENDP -> next PROC pair in a module, with the count of blank lines between them. The project standard is 2; consumers compare blank_lines_between against their own expected count."),
+		mcp.WithString("file", mcp.Required(),
+			mcp.Description("Source file (basename or absolute path)")),
+	), s.handleProcSpacing)
+
+	srv.AddTool(mcp.NewTool("proc_header_card_coverage",
+		mcp.WithDescription("Quality-audit primitive (criterion 4). Classify each PROC's preamble comment block as `structured` (top-and-bottom `;==…==` brackets), `one_liner` (single comment line above the PROC), `legacy_banner` (deprecated `; ---- <Name>` form), or `missing`. For structured cards, lists the named fields present (purpose / in / out / trashes / notes)."),
+		mcp.WithString("file", mcp.Required(),
+			mcp.Description("Source file (basename or absolute path)")),
+		mcp.WithString("proc",
+			mcp.Description("Optional: limit to one PROC")),
+	), s.handleProcHeaderCardCoverage)
+
+	srv.AddTool(mcp.NewTool("magic_immediate_scan",
+		mcp.WithDescription("Quality-audit primitive (criterion 5). List every immediate >= min_value (default 0x100) in a module, with annotation status, EQU match, and excluded-class reasoning (`offset_table` / `port_with_equ` / `bit_pattern`). Audit consumers count records that have no substantive annotation, no EQU match, and no exclusion."),
+		mcp.WithString("file", mcp.Required()),
+		mcp.WithString("proc",
+			mcp.Description("Optional: limit to one PROC")),
+		mcp.WithNumber("min_value",
+			mcp.Description("Minimum immediate value to report (default 0x100)")),
+	), s.handleMagicImmediateScan)
+
+	srv.AddTool(mcp.NewTool("xref_coverage",
+		mcp.WithDescription("Quality-audit primitive (criterion 6). Enumerate cross-references in a module (call / jmp / mem_read / mem_write) with inline-annotation status and an external-doc lookup over `doc/fn_*.md` and `doc/modules/*.md` (configured via `doc_paths`). Audit consumers fail records where neither inline nor external documentation exists."),
+		mcp.WithString("file", mcp.Required()),
+		mcp.WithString("proc",
+			mcp.Description("Optional: limit to one PROC")),
+		mcp.WithString("kinds",
+			mcp.Description("Comma-separated subset of [call, jmp, mem_read, mem_write] (default: all)")),
+	), s.handleXrefCoverage)
+
 	srv.AddTool(mcp.NewTool("smc_clusters",
 		mcp.WithDescription("Group SMC anchors into clusters. Three grouping modes:\n  - by=\"proximity\" (default): anchors that share a source file AND lie within `max_gap` bytes of each other (default 16). Catches runs of 2-3 consecutive immediates patched together.\n  - by=\"writer_proc\" / \"reader_proc\": vars touched by the same PROC. Catches matrix-broadcast patterns where a single PROC reads or writes 4+ slots back-to-back even when they span ~150 source lines. Module-scope refs surface under the synthetic key `<file>:module-scope`.\n  - by=\"writer_file\" / \"reader_file\": coarser, file-keyed grouping. Right shape for module-scope setup blocks (e.g. polydraw.inc's 18 SMC slots all written at file scope without a PROC wrapper).\nEach cluster surfaces its members (anchor, var alias, slot info, host instruction). Proximity clusters also list the writer PROCs that touch any var in the cluster. Use proc/file-keyed clustering BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
 		mcp.WithString("by",
@@ -996,6 +1028,159 @@ func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) 
 		res["note"] = "no symbols declared in this byte range -- check the addr or pass a wider size"
 	}
 	return jsonText(res), nil
+}
+
+// handleProcSpacing returns blank-line counts between consecutive PROCs.
+func (s *Server) handleProcSpacing(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	file, err := req.RequireString("file")
+	if err != nil {
+		return errResult("missing 'file': " + err.Error()), nil
+	}
+	abs := s.resolveFile(file)
+	pairs := s.Index().ProcSpacing(abs)
+	out := make([]map[string]any, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, map[string]any{
+			"prev_proc":                p.PrevProc,
+			"prev_endp_line":           p.PrevEndpLine,
+			"next_proc":                p.NextProc,
+			"next_proc_line":           p.NextProcLine,
+			"next_preamble_start_line": p.NextPreambleStartLine,
+			"blank_lines_between":      p.BlankLines,
+		})
+	}
+	return jsonText(map[string]any{
+		"file":  filepath.Base(abs),
+		"pairs": out,
+		"count": len(out),
+	}), nil
+}
+
+// handleProcHeaderCardCoverage classifies each PROC's preamble.
+func (s *Server) handleProcHeaderCardCoverage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	file, err := req.RequireString("file")
+	if err != nil {
+		return errResult("missing 'file': " + err.Error()), nil
+	}
+	procFilter := req.GetString("proc", "")
+	abs := s.resolveFile(file)
+	cards := s.Index().ProcHeaderCardCoverage(abs, procFilter)
+	out := make([]map[string]any, 0, len(cards))
+	for _, c := range cards {
+		entry := map[string]any{
+			"proc":         c.Proc,
+			"line":         c.Line,
+			"header_kind":  string(c.HeaderKind),
+			"header_lines": c.HeaderLines,
+		}
+		if len(c.FieldsPresent) > 0 {
+			entry["fields_present"] = c.FieldsPresent
+		}
+		if len(c.Issues) > 0 {
+			entry["issues"] = c.Issues
+		} else {
+			entry["issues"] = []string{}
+		}
+		out = append(out, entry)
+	}
+	return jsonText(map[string]any{
+		"file":  filepath.Base(abs),
+		"procs": out,
+		"count": len(out),
+	}), nil
+}
+
+// handleMagicImmediateScan reports magic-number immediates.
+func (s *Server) handleMagicImmediateScan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	file, err := req.RequireString("file")
+	if err != nil {
+		return errResult("missing 'file': " + err.Error()), nil
+	}
+	procFilter := req.GetString("proc", "")
+	minValue := int64(req.GetFloat("min_value", 0x100))
+	abs := s.resolveFile(file)
+	hits := s.Index().MagicImmediateScan(abs, procFilter, minValue)
+	out := make([]map[string]any, 0, len(hits))
+	for _, h := range hits {
+		entry := map[string]any{
+			"line":      h.Line,
+			"in_proc":   h.InProc,
+			"mnemonic":  h.Mnemonic,
+			"operand":   h.Operand,
+			"value":     h.Value,
+			"annotation": map[string]any{
+				"end_of_line_comment":        nullableString(h.EOLComment),
+				"has_substantive_annotation": h.HasSubstantiveAnnotation,
+			},
+			"equ_match": map[string]any{
+				"symbol": nullableString(h.EquSymbol),
+				"source": nullableString(h.EquSource),
+			},
+			"excluded_class": map[string]any{
+				"is_excluded": h.IsExcluded,
+				"reason":      nullableString(h.ExclusionReason),
+			},
+		}
+		out = append(out, entry)
+	}
+	return jsonText(map[string]any{
+		"file":      filepath.Base(abs),
+		"min_value": minValue,
+		"items":     out,
+		"count":     len(out),
+	}), nil
+}
+
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// handleXrefCoverage enumerates external xrefs and their doc status.
+func (s *Server) handleXrefCoverage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	file, err := req.RequireString("file")
+	if err != nil {
+		return errResult("missing 'file': " + err.Error()), nil
+	}
+	procFilter := req.GetString("proc", "")
+	kindsCSV := req.GetString("kinds", "")
+	var kinds []string
+	if kindsCSV != "" {
+		for _, k := range strings.Split(kindsCSV, ",") {
+			if t := strings.TrimSpace(k); t != "" {
+				kinds = append(kinds, t)
+			}
+		}
+	}
+	abs := s.resolveFile(file)
+	xrefs := s.Index().XrefCoverageScan(abs, procFilter, kinds, s.cfg.DocPaths)
+	out := make([]map[string]any, 0, len(xrefs))
+	for _, x := range xrefs {
+		entry := map[string]any{
+			"line":               x.Line,
+			"in_proc":            x.InProc,
+			"kind":               x.Kind,
+			"target_symbol":      nullableString(x.TargetSymbol),
+			"target_kind":        x.TargetKind,
+			"external_to_module": x.ExternalToModule,
+			"inline_annotation": map[string]any{
+				"comment":        nullableString(x.InlineComment),
+				"is_substantive": x.IsSubstantive,
+			},
+			"external_doc": map[string]any{
+				"documented_in": x.DocumentedIn,
+				"found":         x.DocFound,
+			},
+		}
+		out = append(out, entry)
+	}
+	return jsonText(map[string]any{
+		"file":  filepath.Base(abs),
+		"items": out,
+		"count": len(out),
+	}), nil
 }
 
 // handleVarAnnotation reads the configured annotation JSON file and
