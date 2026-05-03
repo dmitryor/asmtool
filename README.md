@@ -80,6 +80,10 @@ Composite:
   Splits a 30-var perframe.inc cluster into its 4 natural
   sub-groups (motion-delta broadcast, SP-anchor pair, LOD-scale
   group, timer pair) without visual scanning.
+  Each cluster member also carries the host-instruction `role`
+  tag (same vocabulary as `smc_var_info`), and each cluster
+  reports a `role_counts` aggregate so a glance distinguishes
+  homogeneous (`{value_load_imm: 8}`) from mixed clusters.
 - `unresolved(kind, limit)` — scaffolding backlog ranked by reference count;
   `kind` ∈ `procs` (default), `data`, `all`
 

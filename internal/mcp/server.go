@@ -1036,7 +1036,9 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 		out := make([]map[string]any, 0, len(procClusters))
 		for _, c := range procClusters {
 			vars := make([]map[string]any, 0, len(c.Vars))
+			roleCounts := map[string]int{}
 			for _, v := range c.Vars {
+				hostRole := index.ClassifyHostRole(v.HostInstr)
 				row := map[string]any{
 					"var":              v.Var.Name,
 					"anchor":           v.Anchor.Name,
@@ -1046,6 +1048,12 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 					"slot":             map[string]any{"size": v.Slot.Size, "offset": v.Slot.Offset},
 					"host_instruction": v.HostInstr,
 				}
+				if hostRole != "" {
+					row["role"] = hostRole
+					roleCounts[hostRole]++
+				} else {
+					roleCounts[""]++
+				}
 				vars = append(vars, row)
 			}
 			entry := map[string]any{
@@ -1054,24 +1062,40 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 				"var_count": len(c.Vars),
 				"vars":      vars,
 			}
+			if len(roleCounts) > 0 {
+				entry["role_counts"] = roleCounts
+			}
 			if len(c.SubClusters) > 0 {
 				subs := make([]map[string]any, 0, len(c.SubClusters))
 				for _, sc := range c.SubClusters {
 					subVars := make([]map[string]any, 0, len(sc.Vars))
+					subRoleCounts := map[string]int{}
 					for _, v := range sc.Vars {
-						subVars = append(subVars, map[string]any{
+						hostRole := index.ClassifyHostRole(v.HostInstr)
+						subRow := map[string]any{
 							"var":    v.Var.Name,
 							"anchor": v.Anchor.Name,
 							"addr":   fmt.Sprintf("0x%04x", v.Anchor.Addr),
 							"slot":   map[string]any{"size": v.Slot.Size, "offset": v.Slot.Offset},
-						})
+						}
+						if hostRole != "" {
+							subRow["role"] = hostRole
+							subRoleCounts[hostRole]++
+						} else {
+							subRoleCounts[""]++
+						}
+						subVars = append(subVars, subRow)
 					}
-					subs = append(subs, map[string]any{
+					subEntry := map[string]any{
 						"line_start": sc.LineStart,
 						"line_end":   sc.LineEnd,
 						"var_count":  len(sc.Vars),
 						"vars":       subVars,
-					})
+					}
+					if len(subRoleCounts) > 0 {
+						subEntry["role_counts"] = subRoleCounts
+					}
+					subs = append(subs, subEntry)
 				}
 				entry["sub_clusters"] = subs
 				entry["sub_cluster_count"] = len(subs)
@@ -1100,7 +1124,9 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 	out := make([]map[string]any, 0, len(clusters))
 	for _, c := range clusters {
 		anchors := make([]map[string]any, 0, len(c.Anchors))
+		roleCounts := map[string]int{}
 		for _, a := range c.Anchors {
+			hostRole := index.ClassifyHostRole(a.HostInstr)
 			row := map[string]any{
 				"anchor":           a.Anchor.Name,
 				"addr":             fmt.Sprintf("0x%04x", a.Anchor.Addr),
@@ -1114,6 +1140,12 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 					"offset": a.Slot.Offset,
 				}
 			}
+			if hostRole != "" {
+				row["role"] = hostRole
+				roleCounts[hostRole]++
+			} else {
+				roleCounts[""]++
+			}
 			anchors = append(anchors, row)
 		}
 		entry := map[string]any{
@@ -1123,6 +1155,9 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 			"size_bytes":   c.EndAddr - c.StartAddr,
 			"anchor_count": len(c.Anchors),
 			"anchors":      anchors,
+		}
+		if len(roleCounts) > 0 {
+			entry["role_counts"] = roleCounts
 		}
 		if len(c.Procs) > 0 {
 			entry["writer_procs"] = c.Procs
