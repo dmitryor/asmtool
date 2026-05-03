@@ -65,8 +65,9 @@ Quality-audit primitives (consumed by `quality_audit.py`):
   ≥ `min_value` (default 0x100) with annotation status, EQU match,
   and excluded-class reasoning (criterion 5).
 - `xref_coverage(file, proc?, kinds?)` — call/jmp/mem_read/mem_write
-  xrefs with inline-annotation status and an external-doc lookup
-  over `doc/fn_*.md` and `doc/modules/*.md` (criterion 6).
+  xrefs with inline-annotation status AND target-declaration
+  preamble (the comment block above where the target symbol is
+  declared). Covered when either is substantive (criterion 6).
 
 Composite:
 

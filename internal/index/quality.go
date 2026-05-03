@@ -1,7 +1,6 @@
 package index
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -576,8 +575,9 @@ func isSelfEvidentBitPattern(v uint64) bool {
 
 // ----- xref_coverage -----
 
-// XrefCoverage is one cross-reference site with its annotation /
-// documentation status.
+// XrefCoverage is one cross-reference site with its annotation status.
+// Coverage is satisfied either by an inline comment on the call site
+// OR by a substantive preamble comment at the target's declaration.
 type XrefCoverage struct {
 	Line             int
 	Addr             uint32
@@ -587,17 +587,20 @@ type XrefCoverage struct {
 	TargetSymbol     string
 	TargetKind       string // proc | data | label | indirect
 	ExternalToModule bool
-	InlineComment    string
-	IsSubstantive    bool
-	DocumentedIn     []string
-	DocFound         bool
+	// Inline annotation on the call site itself.
+	InlineComment       string
+	InlineIsSubstantive bool
+	// Annotation at the target's declaration site (preamble comment block
+	// immediately above the declaration line).
+	TargetDeclaredIn        string // file:line, empty if target not found
+	TargetCommentBlock      string // preamble text (comments joined with newline), empty if none
+	TargetIsSubstantive     bool
 }
 
 // XrefCoverageScan returns one record per cross-reference site in the
 // module. `kinds` (when non-empty) restricts the scan; default is all
-// four (call, jmp, mem_read, mem_write). `docPaths` is the list of
-// directories under which `fn_*.md` and `modules/*.md` are searched.
-func (idx *Index) XrefCoverageScan(file, procFilter string, kinds []string, docPaths []string) []XrefCoverage {
+// four (call, jmp, mem_read, mem_write).
+func (idx *Index) XrefCoverageScan(file, procFilter string, kinds []string) []XrefCoverage {
 	idx.mu.RLock()
 	f := idx.Files[file]
 	idx.mu.RUnlock()
@@ -612,7 +615,6 @@ func (idx *Index) XrefCoverageScan(file, procFilter string, kinds []string, docP
 			want[k] = true
 		}
 	}
-	docHits := buildDocHits(docPaths)
 	var out []XrefCoverage
 	idx.mu.RLock()
 	for _, refs := range idx.Refs {
@@ -635,19 +637,20 @@ func (idx *Index) XrefCoverageScan(file, procFilter string, kinds []string, docP
 			}
 			_, comment := splitLineComment(r.Text)
 			x.InlineComment = strings.TrimSpace(strings.TrimPrefix(comment, ";"))
-			x.IsSubstantive = isSubstantiveComment(x.InlineComment)
+			x.InlineIsSubstantive = isSubstantiveComment(x.InlineComment)
 			if decls := idx.Symbols[r.Target]; len(decls) > 0 {
 				d := decls[0]
 				x.TargetKind = mapDeclKindToTargetKind(d.Kind)
 				x.ExternalToModule = d.File != file
+				x.TargetDeclaredIn = filepath.Base(d.File) + ":" + strconv.Itoa(d.Line)
+				if df := idx.Files[d.File]; df != nil && d.Line > 0 {
+					if block, ok := readDeclPreamble(df.Lines, d.Line); ok {
+						x.TargetCommentBlock = block
+						x.TargetIsSubstantive = isSubstantiveComment(stripCommentPrefixes(block))
+					}
+				}
 			} else {
 				x.TargetKind = "indirect"
-			}
-			if hits, ok := docHits[r.Target]; ok {
-				x.DocumentedIn = hits
-				x.DocFound = true
-			} else {
-				x.DocumentedIn = []string{}
 			}
 			out = append(out, x)
 		}
@@ -660,6 +663,38 @@ func (idx *Index) XrefCoverageScan(file, procFilter string, kinds []string, docP
 		return out[i].TargetSymbol < out[j].TargetSymbol
 	})
 	return out
+}
+
+// readDeclPreamble returns the comment block immediately above
+// declaration line `line` (lines starting with `;`, walked backwards).
+// Returns (joined, true) when at least one preamble line exists,
+// otherwise ("", false).
+func readDeclPreamble(lines []string, line int) (string, bool) {
+	start := preambleStart(lines, line)
+	if start >= line {
+		return "", false
+	}
+	parts := make([]string, 0, line-start)
+	for ln := start; ln < line; ln++ {
+		parts = append(parts, lines[ln-1])
+	}
+	return strings.Join(parts, "\n") + "\n", true
+}
+
+// stripCommentPrefixes removes the leading `;` (and any spaces after it)
+// from each line of a joined preamble block, so isSubstantiveComment
+// can evaluate it against the same heuristic used for inline comments.
+func stripCommentPrefixes(block string) string {
+	out := make([]string, 0)
+	for _, line := range strings.Split(block, "\n") {
+		s := strings.TrimSpace(line)
+		s = strings.TrimPrefix(s, ";")
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 func classifyRefKind(r *RefEntry) string {
@@ -690,92 +725,3 @@ func mapDeclKindToTargetKind(declKind string) string {
 	}
 }
 
-// buildDocHits walks docPaths once and returns symbol -> []doc-paths-where-found.
-// Match rule: case-sensitive, word-boundary occurrence in any *.md file under
-// `doc/fn_*` or `doc/modules/*` subtrees.
-func buildDocHits(docPaths []string) map[string][]string {
-	out := map[string][]string{}
-	if len(docPaths) == 0 {
-		return out
-	}
-	for _, root := range docPaths {
-		walkDocFiles(root, func(path, content string) {
-			base := filepath.Base(path)
-			parent := filepath.Base(filepath.Dir(path))
-			if !strings.HasPrefix(base, "fn_") && parent != "modules" {
-				return
-			}
-			for _, name := range extractDocSymbols(content) {
-				out[name] = appendUnique(out[name], path)
-			}
-		})
-	}
-	return out
-}
-
-// extractDocSymbols heuristically pulls out symbol-like tokens from
-// markdown: identifier-like words bounded by non-identifier chars.
-// We index every token >= 4 chars whose first char is an identifier
-// start byte; a simple over-approximation of "names referenced by this
-// file" that the lookup code intersects with the set of actual symbols.
-func extractDocSymbols(content string) []string {
-	seen := map[string]bool{}
-	var out []string
-	i := 0
-	for i < len(content) {
-		c := content[i]
-		if !isIdentStartByteByte(c) {
-			i++
-			continue
-		}
-		j := i
-		for j < len(content) && isIdentByteByte(content[j]) {
-			j++
-		}
-		tok := content[i:j]
-		i = j
-		if len(tok) < 4 {
-			continue
-		}
-		if !seen[tok] {
-			seen[tok] = true
-			out = append(out, tok)
-		}
-	}
-	return out
-}
-
-func isIdentStartByteByte(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
-}
-
-func isIdentByteByte(b byte) bool {
-	return isIdentStartByteByte(b) || (b >= '0' && b <= '9')
-}
-
-func appendUnique(xs []string, x string) []string {
-	for _, v := range xs {
-		if v == x {
-			return xs
-		}
-	}
-	return append(xs, x)
-}
-
-// walkDocFiles invokes fn(path, content) for every *.md file under root.
-func walkDocFiles(root string, fn func(path, content string)) {
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		if filepath.Ext(path) != ".md" {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		fn(path, string(data))
-		return nil
-	})
-}

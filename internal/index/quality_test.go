@@ -208,29 +208,44 @@ func TestMagicImmediateScan(t *testing.T) {
 
 func TestXrefCoverage(t *testing.T) {
 	srcFile := "render3d.inc"
-	otherFile := "math.inc"
-	lines := []string{
+	mathFile := "math.inc"
+	globalsFile := "globals.inc"
+	srcLines := []string{
 		"ProjectVertex PROC NEAR",
-		"    call FixedMul",
+		"    call FixedMul                            ; signed 16x16 fixed-point product",
 		"    mov ax, [ScreenWidth]",
 		"    mov [LocalCounter], bx",
 		"ProjectVertex ENDP",
 	}
+	// math.inc: FixedMul at line 5 with a structured preamble (lines 2..4).
+	mathLines := make([]string, 10)
+	mathLines[1] = ";=========================================================================="
+	mathLines[2] = "; Signed 16x16 -> 32 fixed-point multiply."
+	mathLines[3] = ";=========================================================================="
+	mathLines[4] = "FixedMul PROC NEAR"
+	// globals.inc: ScreenWidth at line 5 with NO preamble.
+	globalsLines := make([]string, 10)
+	globalsLines[4] = "ScreenWidth dw 0"
 	idx := &Index{
-		Files: map[string]*source.File{srcFile: {Path: srcFile, Lines: lines}},
+		Files: map[string]*source.File{
+			srcFile:     {Path: srcFile, Lines: srcLines},
+			mathFile:    {Path: mathFile, Lines: mathLines},
+			globalsFile: {Path: globalsFile, Lines: globalsLines},
+		},
 		Procs: map[string]*ProcEntry{
 			"ProjectVertex": {Name: "ProjectVertex", File: srcFile, StartLine: 1, EndLine: 5},
+			"FixedMul":      {Name: "FixedMul", File: mathFile, StartLine: 5, EndLine: 9},
 		},
 		Symbols: map[string][]*SymbolEntry{
-			"FixedMul":      {{Name: "FixedMul", Kind: "PROC", File: otherFile, Line: 100}},
-			"ScreenWidth":   {{Name: "ScreenWidth", Kind: "data", File: otherFile, Line: 50}},
-			"LocalCounter":  {{Name: "LocalCounter", Kind: "data", File: srcFile, Line: 30}},
+			"FixedMul":     {{Name: "FixedMul", Kind: "PROC", File: mathFile, Line: 5}},
+			"ScreenWidth":  {{Name: "ScreenWidth", Kind: "data", File: globalsFile, Line: 5}},
+			"LocalCounter": {{Name: "LocalCounter", Kind: "data", File: srcFile, Line: 30}},
 		},
 		Refs: map[string][]*RefEntry{
 			"FixedMul": {{
 				Target: "FixedMul", Kind: "call",
 				File: srcFile, Line: 2, EnclosingProc: "ProjectVertex",
-				Text: "    call FixedMul",
+				Text: "    call FixedMul                            ; signed 16x16 fixed-point product",
 			}},
 			"ScreenWidth": {{
 				Target: "ScreenWidth", Kind: "mem",
@@ -244,7 +259,7 @@ func TestXrefCoverage(t *testing.T) {
 			}},
 		},
 	}
-	xrefs := idx.XrefCoverageScan(srcFile, "", nil, nil)
+	xrefs := idx.XrefCoverageScan(srcFile, "", nil)
 	if len(xrefs) != 3 {
 		t.Fatalf("got %d xrefs, want 3", len(xrefs))
 	}
@@ -252,17 +267,30 @@ func TestXrefCoverage(t *testing.T) {
 	for _, x := range xrefs {
 		got[x.TargetSymbol] = x
 	}
+	// FixedMul: inline-annotated -> covered via inline.
 	if got["FixedMul"].Kind != "call" || !got["FixedMul"].ExternalToModule {
 		t.Errorf("FixedMul: %+v", got["FixedMul"])
 	}
+	if !got["FixedMul"].InlineIsSubstantive {
+		t.Errorf("FixedMul should be inline-annotated; got %+v", got["FixedMul"])
+	}
+	// FixedMul's declaration also has a substantive preamble.
+	if !got["FixedMul"].TargetIsSubstantive {
+		t.Errorf("FixedMul preamble should be substantive; got block=%q", got["FixedMul"].TargetCommentBlock)
+	}
+	// ScreenWidth: no inline comment, no declaration preamble -> uncovered.
 	if got["ScreenWidth"].Kind != "mem_read" || !got["ScreenWidth"].ExternalToModule {
 		t.Errorf("ScreenWidth: %+v", got["ScreenWidth"])
 	}
+	if got["ScreenWidth"].InlineIsSubstantive || got["ScreenWidth"].TargetIsSubstantive {
+		t.Errorf("ScreenWidth should be UNcovered; got %+v", got["ScreenWidth"])
+	}
+	// LocalCounter: intra-module + write classification.
 	if got["LocalCounter"].Kind != "mem_write" || got["LocalCounter"].ExternalToModule {
 		t.Errorf("LocalCounter: %+v", got["LocalCounter"])
 	}
 	// kinds filter
-	xrefs = idx.XrefCoverageScan(srcFile, "", []string{"call"}, nil)
+	xrefs = idx.XrefCoverageScan(srcFile, "", []string{"call"})
 	if len(xrefs) != 1 || xrefs[0].TargetSymbol != "FixedMul" {
 		t.Errorf("call-only filter: %+v", xrefs)
 	}

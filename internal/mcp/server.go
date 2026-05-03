@@ -246,7 +246,7 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 	), s.handleMagicImmediateScan)
 
 	srv.AddTool(mcp.NewTool("xref_coverage",
-		mcp.WithDescription("Quality-audit primitive (criterion 6). Enumerate cross-references in a module (call / jmp / mem_read / mem_write) with inline-annotation status and an external-doc lookup over `doc/fn_*.md` and `doc/modules/*.md` (configured via `doc_paths`). Audit consumers fail records where neither inline nor external documentation exists."),
+		mcp.WithDescription("Quality-audit primitive (criterion 6). Enumerate cross-references in a module (call / jmp / mem_read / mem_write). For each site, reports inline-annotation status (the `;` comment on the call line) AND target-declaration-annotation status (the preamble comment block immediately above the target symbol's declaration). A site is covered when either is substantive."),
 		mcp.WithString("file", mcp.Required()),
 		mcp.WithString("proc",
 			mcp.Description("Optional: limit to one PROC")),
@@ -1155,7 +1155,7 @@ func (s *Server) handleXrefCoverage(ctx context.Context, req mcp.CallToolRequest
 		}
 	}
 	abs := s.resolveFile(file)
-	xrefs := s.Index().XrefCoverageScan(abs, procFilter, kinds, s.cfg.DocPaths)
+	xrefs := s.Index().XrefCoverageScan(abs, procFilter, kinds)
 	out := make([]map[string]any, 0, len(xrefs))
 	for _, x := range xrefs {
 		entry := map[string]any{
@@ -1167,11 +1167,12 @@ func (s *Server) handleXrefCoverage(ctx context.Context, req mcp.CallToolRequest
 			"external_to_module": x.ExternalToModule,
 			"inline_annotation": map[string]any{
 				"comment":        nullableString(x.InlineComment),
-				"is_substantive": x.IsSubstantive,
+				"is_substantive": x.InlineIsSubstantive,
 			},
-			"external_doc": map[string]any{
-				"documented_in": x.DocumentedIn,
-				"found":         x.DocFound,
+			"target_declaration_annotation": map[string]any{
+				"declared_in":    nullableString(x.TargetDeclaredIn),
+				"comment_block":  nullableString(x.TargetCommentBlock),
+				"is_substantive": x.TargetIsSubstantive,
 			},
 		}
 		out = append(out, entry)
