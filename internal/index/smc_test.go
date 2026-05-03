@@ -176,6 +176,156 @@ func TestVarD2a7MultiInstructionWalk(t *testing.T) {
 	}
 }
 
+func TestFindMirrorWrites(t *testing.T) {
+	// Synthesise a writer PROC that broadcasts AX to three slots,
+	// then a different value (BX) to two slots -- exactly the
+	// ComputeViewMatrix shape on a smaller scale.
+	idx := buildSmcFixture()
+	procName := "ComputeViewMatrix"
+	mkVar := func(name string, line int, text string) {
+		idx.Refs[name] = []*RefEntry{{
+			Target: name, Kind: "mem",
+			File: "math.inc", Line: line,
+			EnclosingProc: procName,
+			Text:          text,
+		}}
+	}
+	// AX broadcast: 3 stores at lines 100, 102, 104
+	mkVar("Var_M00_a", 100, "mov [Var_M00_a], ax")
+	mkVar("Var_M00_b", 102, "mov [Var_M00_b], ax")
+	mkVar("Var_M00_c", 104, "mov [Var_M00_c], ax")
+	// Gap then a CX broadcast: 2 stores at lines 200, 201
+	mkVar("Var_M01_a", 200, "mov [Var_M01_a], cx")
+	mkVar("Var_M01_b", 201, "mov [Var_M01_b], cx")
+
+	groups := idx.FindMirrorWrites(procName, 5, 2)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(groups), groups)
+	}
+	if groups[0].Source != "ax" || len(groups[0].Writes) != 3 {
+		t.Errorf("group[0] (ax broadcast): %+v", groups[0])
+	}
+	if groups[1].Source != "cx" || len(groups[1].Writes) != 2 {
+		t.Errorf("group[1] (cx broadcast): %+v", groups[1])
+	}
+	if groups[0].LineStart != 100 || groups[0].LineEnd != 104 {
+		t.Errorf("group[0] line range: %d..%d", groups[0].LineStart, groups[0].LineEnd)
+	}
+
+	// With a tighter gap=1, the AX broadcast should split (gap is 2
+	// between consecutive lines). Result: each store its own group, all
+	// dropped by minSize=2.
+	groups = idx.FindMirrorWrites(procName, 0, 2)
+	if len(groups) != 0 {
+		t.Errorf("with max_line_gap=0, expected 0 surviving groups; got %d", len(groups))
+	}
+
+	// proc filter mismatch: empty result.
+	groups = idx.FindMirrorWrites("OtherProc", 5, 2)
+	if len(groups) != 0 {
+		t.Errorf("OtherProc filter: %d groups", len(groups))
+	}
+}
+
+func TestCarryChainPair(t *testing.T) {
+	// Layout: sub at 0xc000 (3 bytes, slot at +1) followed by
+	// sbb at 0xc003 (3 bytes, slot at +1). Both slots are SMC-aliased.
+	idx := buildSmcFixture()
+	idx.instructions = append(idx.instructions,
+		jwasm.Instruction{Addr: 0xc000, Size: 3, Bytes: "2D0000", Text: "sub ax, 0"},
+		jwasm.Instruction{Addr: 0xc003, Size: 3, Bytes: "1D0000", Text: "sbb dx, 0"},
+	)
+	// Re-sort instructions
+	for i := 0; i < len(idx.instructions)-1; i++ {
+		for j := i + 1; j < len(idx.instructions); j++ {
+			if idx.instructions[i].Addr > idx.instructions[j].Addr {
+				idx.instructions[i], idx.instructions[j] = idx.instructions[j], idx.instructions[i]
+			}
+		}
+	}
+	idx.Symbols["SmcAnchor_c000"] = []*SymbolEntry{{
+		Name: "SmcAnchor_c000", Kind: "export", File: "x.inc", Line: 1,
+		Addr: 0xc000, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["SmcAnchor_c003"] = []*SymbolEntry{{
+		Name: "SmcAnchor_c003", Kind: "export", File: "x.inc", Line: 2,
+		Addr: 0xc003, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_c001"] = []*SymbolEntry{{
+		Name: "Var_c001", Kind: "EQU", File: "g.inc", Line: 1,
+		Text: "word ptr SmcAnchor_c000 + 1",
+	}}
+	idx.Symbols["Var_c004"] = []*SymbolEntry{{
+		Name: "Var_c004", Kind: "EQU", File: "g.inc", Line: 2,
+		Text: "word ptr SmcAnchor_c003 + 1",
+	}}
+
+	// Querying the lo (sub) anchor: the chain partner is the sbb's slot.
+	kind, sib := idx.CarryChainPair(idx.Symbols["SmcAnchor_c000"][0])
+	if kind != "carry_chain_lo" || sib != "Var_c004" {
+		t.Errorf("from lo anchor: got (%q, %q), want (carry_chain_lo, Var_c004)", kind, sib)
+	}
+	// Querying the hi (sbb) anchor: partner is the sub's slot.
+	kind, sib = idx.CarryChainPair(idx.Symbols["SmcAnchor_c003"][0])
+	if kind != "carry_chain_hi" || sib != "Var_c001" {
+		t.Errorf("from hi anchor: got (%q, %q), want (carry_chain_hi, Var_c001)", kind, sib)
+	}
+	// Solitary anchor (FlightModelUpdate's are mov-style, not sub/sbb)
+	// has no chain.
+	kind, _ = idx.CarryChainPair(idx.Symbols["SmcAnchor_a71f"][0])
+	if kind != "" {
+		t.Errorf("solitary anchor should not chain; got kind=%q", kind)
+	}
+}
+
+func TestSelfStoringWrites(t *testing.T) {
+	// Anchor: `mov bp, 0` at addr 0xd000 (3 bytes).
+	// Writer: `mov [Var_d001], bp` -- BP is the host's destination AND
+	// the writer's source, signalling the self-storing list-head pattern.
+	idx := buildSmcFixture()
+	idx.Files["x.inc"] = &source.File{
+		Path:  "x.inc",
+		Lines: []string{"SmcAnchor_d000:: mov bp, 0"},
+	}
+	idx.Symbols["SmcAnchor_d000"] = []*SymbolEntry{{
+		Name: "SmcAnchor_d000", Kind: "export", File: "x.inc", Line: 1,
+		Addr: 0xd000, HasAddr: true, Segment: "CSEG",
+	}}
+	idx.Symbols["Var_d001"] = []*SymbolEntry{{
+		Name: "Var_d001", Kind: "EQU", File: "g.inc", Line: 10,
+		Text: "word ptr SmcAnchor_d000 + 1",
+	}}
+	idx.Refs["Var_d001"] = []*RefEntry{{
+		Target: "Var_d001", Kind: "mem",
+		File: "y.inc", Line: 100,
+		EnclosingProc: "AppendNode",
+		Text:          "mov [Var_d001], bp",
+	}}
+
+	reg, writes := idx.SelfStoringWrites("Var_d001", idx.Symbols["SmcAnchor_d000"][0])
+	if reg != "bp" {
+		t.Errorf("register: %q, want bp", reg)
+	}
+	if len(writes) != 1 {
+		t.Fatalf("writes: %d, want 1", len(writes))
+	}
+	if writes[0].EnclosingProc != "AppendNode" {
+		t.Errorf("writer proc: %q", writes[0].EnclosingProc)
+	}
+
+	// Negative case: writer source is AX, not BP -- not self-storing.
+	idx.Refs["Var_d001"] = []*RefEntry{{
+		Target: "Var_d001", Kind: "mem",
+		File: "y.inc", Line: 100,
+		EnclosingProc: "AppendNode",
+		Text:          "mov [Var_d001], ax",
+	}}
+	reg, writes = idx.SelfStoringWrites("Var_d001", idx.Symbols["SmcAnchor_d000"][0])
+	if reg != "" || len(writes) != 0 {
+		t.Errorf("non-matching source: got reg=%q writes=%d", reg, len(writes))
+	}
+}
+
 func TestSmcClustersByProc(t *testing.T) {
 	idx := buildSmcFixture()
 	// buildSmcFixture has FlightModelUpdate writing Var_a81b and Var_a81e.

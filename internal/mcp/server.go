@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -238,6 +239,22 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 		mcp.WithNumber("sub_max_line_gap",
 			mcp.Description("With by=writer_*/reader_*: gap (in source lines) below which adjacent writer/reader sites are sub-grouped. Default 25; 0 disables sub-clustering. Surfaces the 4-sub-cluster shape of e.g. perframe.inc (motion-delta broadcast, SP-anchor pair, LOD-scale group, timer pair) inside what would otherwise be a single 30-var blob.")),
 	), s.handleSmcClusters)
+
+	srv.AddTool(mcp.NewTool("var_annotation",
+		mcp.WithDescription("Read-side companion to rename_symbol. Returns the project-specific annotation entry (from annotation_path in .jwasm-mcp.toml -- typically tools/var_classification.json) for the named symbol, merged with live slot metadata when the symbol is an SMC var alias. Use during the rename phase to recall hint/confidence/proposed-name before renaming."),
+		mcp.WithString("name", mcp.Required(),
+			mcp.Description("Symbol name (Var_NNNN, SmcAnchor_NNNN, or any indexed symbol)")),
+	), s.handleVarAnnotation)
+
+	srv.AddTool(mcp.NewTool("find_mirror_writes",
+		mcp.WithDescription("For a writer PROC, return groups of consecutive memory-write refs whose SOURCE operand text is identical -- i.e. the PROC computed one value and broadcast it to N SMC slots back-to-back. Catches the ComputeViewMatrix pattern (one matrix element computed, stored to 3 mirror sites: vertex projection / face renderer / AaBb cull) without the agent having to scan source for triple-stores. Groups are ordered by the lowest source line in the group."),
+		mcp.WithString("proc", mcp.Required(),
+			mcp.Description("Writer PROC name (or '<basename>:module-scope' for module-scope writers)")),
+		mcp.WithNumber("max_line_gap",
+			mcp.Description("Max gap (in source lines) between consecutive writes to keep them in the same group. Default 5.")),
+		mcp.WithNumber("min_size",
+			mcp.Description("Minimum group size (default 2)")),
+	), s.handleFindMirrorWrites)
 
 	srv.AddTool(mcp.NewTool("smc_var_info",
 		mcp.WithDescription("Composite read for a self-modifying-code variable. Accepts either the Var_NNNN EQU alias or its SmcAnchor_NNNN host label, and returns the var's typed-pointer slot (size + byte offset), the anchor declaration with address, the host instruction's source line, and a writer/reader split derived from access classification of every memory-operand ref. Replaces the four-call dance (read globals.inc EQU + find_symbol(anchor) + Read host line + find_data_refs(var)) with one call -- the natural primitive for the SMC-annotation worklist."),
@@ -986,6 +1003,118 @@ func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) 
 	return jsonText(res), nil
 }
 
+// handleVarAnnotation reads the configured annotation JSON file and
+// returns the entry for `name`. When the name is an SMC var alias the
+// response also includes live slot metadata (anchor + addr + role)
+// derived from the index. Project-specific by design: the annotation
+// schema is whatever the JSON file uses.
+func (s *Server) handleVarAnnotation(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, err := req.RequireString("name")
+	if err != nil {
+		return errResult("missing 'name': " + err.Error()), nil
+	}
+	if s.cfg.AnnotationPath == "" {
+		return errResult("annotation_path not configured -- set it in .jwasm-mcp.toml to point at your annotation JSON"), nil
+	}
+	data, err := os.ReadFile(s.cfg.AnnotationPath)
+	if err != nil {
+		return errResult(fmt.Sprintf("read annotation file %s: %v", s.cfg.AnnotationPath, err)), nil
+	}
+	var entries map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return errResult(fmt.Sprintf("parse annotation file: %v", err)), nil
+	}
+	res := map[string]any{
+		"name":            name,
+		"annotation_path": s.cfg.AnnotationPath,
+	}
+	if entry, ok := entries[name]; ok {
+		res["annotation"] = entry
+		res["found"] = true
+	} else {
+		res["found"] = false
+		res["note"] = "no entry in annotation file for this name"
+	}
+	idx := s.Index()
+	if decls := idx.FindSymbol(name); len(decls) > 0 {
+		for _, d := range decls {
+			if d.Kind != "EQU" || d.Text == "" {
+				continue
+			}
+			slot, ok := index.ParseSmcEqu(d.Text)
+			if !ok {
+				continue
+			}
+			anchorDecls := idx.FindSymbol(slot.Anchor)
+			if len(anchorDecls) == 0 {
+				continue
+			}
+			anchor := anchorDecls[0]
+			live := map[string]any{
+				"anchor": slot.Anchor,
+				"slot":   map[string]any{"size": slot.Size, "offset": slot.Offset},
+			}
+			if anchor.HasAddr {
+				live["anchor_addr"] = fmt.Sprintf("0x%04x", anchor.Addr)
+			}
+			if instr := idx.HostInstruction(anchor); instr != "" {
+				live["host_instruction"] = instr
+				if role := index.ClassifyHostRole(instr); role != "" {
+					live["host_role"] = role
+				}
+			}
+			res["live"] = live
+			break
+		}
+	}
+	return jsonText(res), nil
+}
+
+// handleFindMirrorWrites scans a writer PROC's mem-write refs and groups
+// consecutive runs whose source operand text is identical. Each group is
+// the broadcast of a single computed value to multiple SMC slots --
+// ComputeViewMatrix's 9-element-x-3-mirror pattern is the canonical case.
+func (s *Server) handleFindMirrorWrites(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	proc, err := req.RequireString("proc")
+	if err != nil {
+		return errResult("missing 'proc': " + err.Error()), nil
+	}
+	maxGap := int(req.GetFloat("max_line_gap", 5))
+	if maxGap < 0 {
+		maxGap = 0
+	}
+	minSize := int(req.GetFloat("min_size", 2))
+	if minSize < 2 {
+		minSize = 2
+	}
+	idx := s.Index()
+	groups := idx.FindMirrorWrites(proc, maxGap, minSize)
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		writes := make([]map[string]any, 0, len(g.Writes))
+		for _, w := range g.Writes {
+			writes = append(writes, map[string]any{
+				"file":   filepath.Base(w.File),
+				"line":   w.Line,
+				"target": w.Target,
+				"text":   w.Text,
+			})
+		}
+		out = append(out, map[string]any{
+			"source":     g.Source,
+			"size":       len(g.Writes),
+			"line_start": g.LineStart,
+			"line_end":   g.LineEnd,
+			"writes":     writes,
+		})
+	}
+	return jsonText(map[string]any{
+		"proc":   proc,
+		"groups": out,
+		"count":  len(out),
+	}), nil
+}
+
 // handleSmcClusters returns SMC anchors grouped either by spatial proximity
 // or by shared writer/reader PROC. See Index.SmcClusters and
 // Index.SmcClustersByProc for the two grouping heuristics.
@@ -1235,19 +1364,44 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 	// relationship so high-byte-of / low-byte-of patterns are
 	// self-documenting (Var_ae68 word at +1, Var_ae69 byte at +2 →
 	// Var_ae69 is the high byte of Var_ae68).
-	if relations := idx.SiblingSlotRelations(varDecl.Name, anchor.Name, slot); len(relations) > 0 {
-		rels := make([]map[string]any, 0, len(relations))
-		for _, r := range relations {
-			rels = append(rels, map[string]any{
-				"kind":    r.Kind,
-				"sibling": r.Sibling,
-				"sibling_slot": map[string]any{
-					"size":   r.SiblingSlot.Size,
-					"offset": r.SiblingSlot.Offset,
-				},
+	rels := make([]map[string]any, 0)
+	for _, r := range idx.SiblingSlotRelations(varDecl.Name, anchor.Name, slot) {
+		rels = append(rels, map[string]any{
+			"kind":    r.Kind,
+			"sibling": r.Sibling,
+			"sibling_slot": map[string]any{
+				"size":   r.SiblingSlot.Size,
+				"offset": r.SiblingSlot.Offset,
+			},
+		})
+	}
+	if kind, sibling := idx.CarryChainPair(anchor); kind != "" {
+		rels = append(rels, map[string]any{
+			"kind":    kind,
+			"sibling": sibling,
+		})
+	}
+	if len(rels) > 0 {
+		slotEntry["relations"] = rels
+	}
+	// Self-storing list-head pattern: anchor is `mov reg, imm` and a
+	// writer writes the same `reg` back into the slot. Surface so the
+	// agent recognises the WalkListAndCullAaBb-style pattern at a glance.
+	if reg, writes := idx.SelfStoringWrites(varDecl.Name, anchor); reg != "" {
+		entries := make([]map[string]any, 0, len(writes))
+		for _, w := range writes {
+			entries = append(entries, map[string]any{
+				"file":    filepath.Base(w.File),
+				"line":    w.Line,
+				"in_proc": w.EnclosingProc,
+				"text":    w.Text,
 			})
 		}
-		slotEntry["relations"] = rels
+		slotEntry["self_storing"] = map[string]any{
+			"register": reg,
+			"writes":   entries,
+			"count":    len(entries),
+		}
 	}
 	res := map[string]any{
 		"var":    varDecl.Name,

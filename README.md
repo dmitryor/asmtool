@@ -45,6 +45,14 @@ Read-only navigation:
   `[addr, addr+size)`. Closes the byte-EQU / word-label overlap case
   where writes go through the wider alias and don't surface under the
   narrow one.
+- `find_mirror_writes(proc, max_line_gap?, min_size?)` — for a writer
+  PROC, return groups of consecutive memory-writes whose source
+  operand is identical. Catches the `ComputeViewMatrix` shape (one
+  computed value broadcast to N SMC slots back-to-back).
+- `var_annotation(name)` — read the project annotation JSON
+  (configured via `annotation_path` in `.jwasm-mcp.toml`) and return
+  the entry for `name` merged with live SMC slot metadata. The
+  rename-phase companion to `rename_symbol`.
 
 Composite:
 
@@ -53,14 +61,18 @@ Composite:
 - `smc_var_info(name)` — SMC slot resolver: takes either a `Var_NNNN` EQU
   alias or its `SmcAnchor_NNNN` host label and returns the typed slot
   (size + offset, plus `relations` linking sibling vars whose byte
-  ranges overlap — e.g. `byte_slice_of: Var_ae68` for a high-byte
-  view), the anchor address, every instruction from the anchor through
-  the slot byte (with byte encoding, a `contains_slot` marker, and a
-  coarse `role` tag on the patched one — `value_load_imm`, `threshold`,
-  `delta`, `deferred_write`, `mask`, `shift`, `interrupt_vector`,
-  `data_filler`, `jump_target`, `stack_anchor`; encoding-macros like
-  `cmp_ax_imm16_long` are classified by their underscore prefix), and a
-  writer/reader split (memory-operand refs classified by access).
+  ranges overlap — e.g. `byte_slice_of: Var_ae68` for a high-byte view
+  — and `carry_chain_lo` / `carry_chain_hi` linking the partner half
+  of a sub+sbb / add+adc 32-bit op, plus `self_storing` when the host
+  is `mov reg, imm` and a writer broadcasts the same `reg` back into
+  the slot — list-head pattern), the anchor address, every instruction
+  from the anchor through the slot byte (with byte encoding, a
+  `contains_slot` marker, and a coarse `role` tag on the patched
+  one — `value_load_imm`, `threshold`, `delta`, `deferred_write`,
+  `mask`, `shift`, `interrupt_vector`, `data_filler`, `jump_target`,
+  `stack_anchor`; encoding-macros like `cmp_ax_imm16_long` are classified
+  by their underscore prefix), and a writer/reader split (memory-operand
+  refs classified by access).
 - `smc_clusters(by?, proc?, file?, max_gap?, min_size?)` — group SMC
   anchors. Three modes:
   - `by="proximity"` (default): same source file + addr gap ≤

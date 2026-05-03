@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
 )
 
 // SmcSlot describes the location and shape of a self-modifying-code slot:
@@ -374,6 +376,214 @@ type SiblingSlotRelation struct {
 	SiblingSlot SmcSlot
 }
 
+// CarryChainPair finds an adjacent SMC-slot pair forming a 32-bit
+// arithmetic operation: a sub/add at addr A whose immediate is a slot,
+// followed by a sbb/adc at addr (A+sizeOfPrev) whose immediate is also
+// a slot. Returns the kind ("carry_chain_lo" if the queried slot is
+// the leading sub/add, "carry_chain_hi" if it's the trailing sbb/adc)
+// and the sibling Var_* name. Returns "", "" when no chain is detected.
+//
+// Used by smc_var_info to surface the round-7 cull-transform pattern
+// (sub_ax_imm16_long X immediately followed by sbb reg, Y; both
+// immediates patched).
+func (idx *Index) CarryChainPair(slotAnchor *SymbolEntry) (kind, sibling string) {
+	if slotAnchor == nil || !slotAnchor.HasAddr {
+		return "", ""
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	thisInstr := idx.instructionAtLocked(slotAnchor.Addr)
+	if thisInstr == nil {
+		return "", ""
+	}
+	thisMnem := firstToken(thisInstr.Text)
+	thisIsLow := isLowMnemonic(thisMnem)
+	thisIsHigh := isHighMnemonic(thisMnem)
+	if !thisIsLow && !thisIsHigh {
+		return "", ""
+	}
+
+	var probeAddr uint32
+	wantHigh := thisIsLow
+	if thisIsLow {
+		probeAddr = thisInstr.Addr + thisInstr.Size
+	} else {
+		// Find the instruction immediately preceding ours.
+		prev := idx.instructionBeforeLocked(thisInstr.Addr)
+		if prev == nil {
+			return "", ""
+		}
+		probeAddr = prev.Addr
+	}
+	other := idx.instructionAtLocked(probeAddr)
+	if other == nil {
+		return "", ""
+	}
+	otherMnem := firstToken(other.Text)
+	if wantHigh && !isHighMnemonic(otherMnem) {
+		return "", ""
+	}
+	if !wantHigh && !isLowMnemonic(otherMnem) {
+		return "", ""
+	}
+	// The sibling instruction must itself host an SMC slot. Look for any
+	// Var_* whose anchor.addr falls inside the sibling instruction's
+	// range (covering both the start-of-instruction case and slots at
+	// non-zero offsets within).
+	for _, decls := range idx.Symbols {
+		for _, s := range decls {
+			if s.Kind != "EQU" || s.Text == "" {
+				continue
+			}
+			slot, ok := ParseSmcEqu(s.Text)
+			if !ok {
+				continue
+			}
+			anchorDecls := idx.Symbols[slot.Anchor]
+			if len(anchorDecls) == 0 {
+				continue
+			}
+			anchor := anchorDecls[0]
+			if !anchor.HasAddr {
+				continue
+			}
+			slotAddr := anchor.Addr + uint32(slot.Offset)
+			if slotAddr < other.Addr || slotAddr >= other.Addr+other.Size {
+				continue
+			}
+			if wantHigh {
+				return "carry_chain_lo", s.Name
+			}
+			return "carry_chain_hi", s.Name
+		}
+	}
+	return "", ""
+}
+
+func (idx *Index) instructionAtLocked(addr uint32) *jwasm.Instruction {
+	if len(idx.instructions) == 0 {
+		return nil
+	}
+	i := sort.Search(len(idx.instructions), func(i int) bool {
+		return idx.instructions[i].Addr > addr
+	})
+	if i == 0 {
+		return nil
+	}
+	c := &idx.instructions[i-1]
+	if addr < c.Addr || addr >= c.Addr+c.Size {
+		return nil
+	}
+	return c
+}
+
+func (idx *Index) instructionBeforeLocked(addr uint32) *jwasm.Instruction {
+	if len(idx.instructions) == 0 {
+		return nil
+	}
+	i := sort.Search(len(idx.instructions), func(i int) bool {
+		return idx.instructions[i].Addr >= addr
+	})
+	if i == 0 {
+		return nil
+	}
+	return &idx.instructions[i-1]
+}
+
+func firstToken(text string) string {
+	s := strings.TrimSpace(text)
+	if i := strings.IndexAny(s, " \t"); i >= 0 {
+		first := s[:i]
+		if strings.HasSuffix(first, ":") {
+			s = strings.TrimSpace(s[i:])
+		}
+	}
+	i := 0
+	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
+		i++
+	}
+	tok := strings.ToLower(s[:i])
+	// Encoding-macro fallback (matches role.go's behaviour).
+	if u := strings.IndexByte(tok, '_'); u > 0 {
+		prefix := tok[:u]
+		if isLowMnemonic(prefix) || isHighMnemonic(prefix) {
+			return prefix
+		}
+	}
+	return tok
+}
+
+func isLowMnemonic(m string) bool {
+	switch m {
+	case "sub", "add":
+		return true
+	}
+	return false
+}
+
+func isHighMnemonic(m string) bool {
+	switch m {
+	case "sbb", "adc":
+		return true
+	}
+	return false
+}
+
+// SelfStoringWrites tags the "self-storing list head" pattern: the
+// host instruction at the anchor is a `mov reg, imm` (role
+// value_load_imm or stack_anchor) and one or more writers against the
+// same var write the SAME register's value back into the slot. Each
+// such write replaces the immediate in-place, so the next time the
+// anchor instruction executes, `reg` is loaded with the freshly
+// written value -- a one-instruction "linked list head" / "stash slot"
+// implementation. Used in WalkListAndCullAaBb (cull-fail / cull-pass
+// list heads, the round-7 naming-log finding).
+//
+// Returns the destination register of the host instruction and the
+// matching writer refs. Empty register means the host isn't a
+// reg-load or no writer matches; callers can treat that as "not self-storing".
+func (idx *Index) SelfStoringWrites(varName string, anchor *SymbolEntry) (register string, writes []*RefEntry) {
+	if anchor == nil {
+		return "", nil
+	}
+	host := idx.HostInstruction(anchor)
+	if host == "" {
+		return "", nil
+	}
+	role := ClassifyHostRole(host)
+	if role != "value_load_imm" && role != "stack_anchor" {
+		return "", nil
+	}
+	_, dst, _ := splitOperands(host)
+	dst = strings.ToLower(strings.TrimSpace(dst))
+	// Reject memory destinations -- those aren't a register being
+	// loaded with the slot's immediate.
+	if dst == "" || strings.HasPrefix(dst, "[") || strings.Contains(dst, "ptr ") || strings.Contains(dst, ":[") {
+		return "", nil
+	}
+	idx.mu.RLock()
+	refs := idx.Refs[varName]
+	idx.mu.RUnlock()
+	for _, r := range refs {
+		if r.Kind != "mem" {
+			continue
+		}
+		access := ClassifyAccess(r)
+		if access != "write" && access != "rw" {
+			continue
+		}
+		_, _, src := splitOperands(r.Text)
+		src = strings.ToLower(strings.TrimSpace(src))
+		if src == dst {
+			writes = append(writes, r)
+		}
+	}
+	if len(writes) == 0 {
+		return "", nil
+	}
+	return dst, writes
+}
+
 // SiblingSlotRelations returns the overlap relationships between the
 // queried var's slot and every other Var_* aliasing the same anchor.
 // Returns nil when no other var aliases the anchor or when the slot
@@ -433,6 +643,140 @@ func slotSizeBytes(s string) int {
 		return 4
 	}
 	return 0
+}
+
+// MirrorWriteGroup represents a run of consecutive memory-write refs
+// inside one writer PROC whose source operand text is identical -- the
+// signature of one computed value being broadcast to N SMC slots
+// back-to-back. ComputeViewMatrix produces 9 such groups, each one
+// matrix element stored to its 3 mirror locations.
+type MirrorWriteGroup struct {
+	// Source is the operand text right of the comma (e.g. "ax", "cx",
+	// "word ptr [bp+4]"). Whitespace-normalised, lowercased.
+	Source    string
+	LineStart int
+	LineEnd   int
+	Writes    []MirrorWrite
+}
+
+// MirrorWrite is one mem-write ref inside a MirrorWriteGroup.
+type MirrorWrite struct {
+	Target string // the destination symbol (the patched SMC slot's var name)
+	File   string
+	Line   int
+	Text   string
+}
+
+// FindMirrorWrites returns groups of consecutive memory-write refs
+// inside `proc` whose source operand is identical and whose source
+// lines sit within `maxLineGap` of each other. Groups smaller than
+// `minSize` are filtered out.
+//
+// `proc` accepts both real PROC names and the synthetic
+// `<basename>:module-scope` key produced by SmcClustersByProc.
+func (idx *Index) FindMirrorWrites(proc string, maxLineGap, minSize int) []MirrorWriteGroup {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if minSize < 2 {
+		minSize = 2
+	}
+	if maxLineGap < 0 {
+		maxLineGap = 0
+	}
+	type writeRow struct {
+		ref    *RefEntry
+		source string
+	}
+	var rows []writeRow
+	for _, refs := range idx.Refs {
+		for _, r := range refs {
+			if r.Kind != "mem" {
+				continue
+			}
+			if access := ClassifyAccess(r); access != "write" && access != "rw" {
+				continue
+			}
+			procKey := r.EnclosingProc
+			if procKey == "" {
+				procKey = ModuleScopeProcKey(r.File)
+			}
+			if procKey != proc {
+				continue
+			}
+			rows = append(rows, writeRow{ref: r, source: extractWriteSource(r.Text)})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].ref.File != rows[j].ref.File {
+			return rows[i].ref.File < rows[j].ref.File
+		}
+		return rows[i].ref.Line < rows[j].ref.Line
+	})
+
+	var groups []MirrorWriteGroup
+	cur := MirrorWriteGroup{}
+	for _, w := range rows {
+		if w.source == "" {
+			// flush current
+			if len(cur.Writes) >= minSize {
+				groups = append(groups, cur)
+			}
+			cur = MirrorWriteGroup{}
+			continue
+		}
+		startNew := len(cur.Writes) == 0 ||
+			cur.Source != w.source ||
+			(w.ref.Line-cur.LineEnd) > maxLineGap
+		if startNew {
+			if len(cur.Writes) >= minSize {
+				groups = append(groups, cur)
+			}
+			cur = MirrorWriteGroup{Source: w.source, LineStart: w.ref.Line, LineEnd: w.ref.Line}
+		}
+		cur.Writes = append(cur.Writes, MirrorWrite{
+			Target: w.ref.Target,
+			File:   w.ref.File,
+			Line:   w.ref.Line,
+			Text:   w.ref.Text,
+		})
+		cur.LineEnd = w.ref.Line
+	}
+	if len(cur.Writes) >= minSize {
+		groups = append(groups, cur)
+	}
+	return groups
+}
+
+// extractWriteSource pulls the source operand from a memory-write
+// instruction's text (the part after the first top-level comma).
+// Returns "" when the line doesn't fit the dst, src shape or when the
+// source operand is itself a memory operand (not a register/imm value
+// being broadcast).
+func extractWriteSource(text string) string {
+	s := strings.TrimSpace(text)
+	// Strip leading label.
+	if i := strings.IndexAny(s, " \t"); i >= 0 {
+		first := s[:i]
+		if strings.HasSuffix(first, ":") {
+			s = strings.TrimSpace(s[i:])
+		}
+	}
+	// Skip mnemonic.
+	i := 0
+	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
+		i++
+	}
+	rest := strings.TrimSpace(s[i:])
+	c := indexTopComma(rest)
+	if c < 0 {
+		return ""
+	}
+	src := strings.TrimSpace(rest[c+1:])
+	// Strip trailing inline comment if any survived.
+	if idx := strings.IndexByte(src, ';'); idx >= 0 {
+		src = strings.TrimSpace(src[:idx])
+	}
+	return strings.ToLower(src)
 }
 
 // SmcProcCluster groups SMC vars by a shared writer or reader PROC. This
