@@ -2,7 +2,6 @@ package jwasm
 
 import (
 	"bufio"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -364,7 +363,3 @@ func parseHexVal(s string) (uint32, bool) {
 	return uint32(v), true
 }
 
-// ParseListingDebug returns a one-line summary for diagnostics.
-func (lf *ListingFile) Summary() string {
-	return fmt.Sprintf("listing: %d symbols", len(lf.Symbols))
-}

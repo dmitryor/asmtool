@@ -341,7 +341,7 @@ func (s *Server) handleFindCallers(ctx context.Context, req mcp.CallToolRequest)
 		return errResult("missing 'name': " + err.Error()), nil
 	}
 	inProc := req.GetString("in_proc", "")
-	refs := s.Index().FindCallersScoped(name, inProc)
+	refs := s.Index().FindCallers(name, inProc)
 	out := make([]map[string]any, 0, len(refs))
 	for _, r := range refs {
 		out = append(out, map[string]any{
@@ -366,7 +366,7 @@ func (s *Server) handleFindDataRefs(ctx context.Context, req mcp.CallToolRequest
 	}
 	inProc := req.GetString("in_proc", "")
 	idx := s.Index()
-	refs := idx.FindDataRefsScoped(name, inProc)
+	refs := idx.FindDataRefs(name, inProc)
 	out := make([]map[string]any, 0, len(refs))
 	byKind := map[string]int{}
 	byAccess := map[string]int{}
@@ -438,7 +438,7 @@ func (s *Server) handleFindDataRefs(ctx context.Context, req mcp.CallToolRequest
 				if sib.Name == name {
 					continue
 				}
-				sibRefs := idx.FindDataRefs(sib.Name)
+				sibRefs := idx.FindDataRefs(sib.Name, "")
 				if len(sibRefs) == 0 {
 					continue
 				}
@@ -479,7 +479,7 @@ func (s *Server) handleFindCallees(ctx context.Context, req mcp.CallToolRequest)
 		}
 		return errResult("PROC not found: " + name + " (and no other declarations in the index)"), nil
 	}
-	external, internal := idx.FindCalleesScoped(name)
+	external, internal := idx.FindCallees(name)
 	mkList := func(refs []*index.RefEntry) []map[string]any {
 		out := make([]map[string]any, 0, len(refs))
 		for _, r := range refs {
@@ -658,11 +658,6 @@ func isDataScaffolding(name string) bool {
 	return false
 }
 
-// isScaffoldingName tests both PROC and data forms.
-func isScaffoldingName(name string) bool {
-	return isProcScaffolding(name) || isDataScaffolding(name)
-}
-
 func looksHexTail(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -718,7 +713,7 @@ func (s *Server) handleUnresolved(ctx context.Context, req mcp.CallToolRequest) 
 				Addr:     p.Addr,
 				HasAddr:  p.HasAddr,
 				Size:     p.EndAddr - p.Addr,
-				RefCount: len(idx.FindCallers(name)),
+				RefCount: len(idx.FindCallers(name, "")),
 			})
 		}
 	}
@@ -959,7 +954,7 @@ func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) 
 	totalRefs := 0
 	totalByAccess := map[string]int{}
 	for _, sym := range syms {
-		refs := idx.FindDataRefs(sym.Name)
+		refs := idx.FindDataRefs(sym.Name, "")
 		entries := make([]map[string]any, 0, len(refs))
 		byAccess := map[string]int{}
 		for _, r := range refs {
@@ -1505,7 +1500,7 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 	// the patches; reads through the anchor itself are implicit (the
 	// runtime reads the patched immediate every time the host instruction
 	// executes), so we only surface mem-operand refs here.
-	refs := idx.FindDataRefs(varDecl.Name)
+	refs := idx.FindDataRefs(varDecl.Name, "")
 	mkRef := func(r *index.RefEntry) map[string]any {
 		return map[string]any{
 			"file":    filepath.Base(r.File),

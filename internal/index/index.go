@@ -290,15 +290,15 @@ func (idx *Index) FindRefs(name string) []*RefEntry {
 
 // FindDataRefs returns refs whose kind is mem/imm/offset/dw/db/dd -- i.e.
 // non-control-transfer uses. The counterpart to FindCallers; useful for
-// understanding how a data symbol is read or written. Scope rules mirror
-// FindCallers: when the queried name has a global declaration, only
-// non-`@@` refs are returned.
-func (idx *Index) FindDataRefs(name string) []*RefEntry {
-	return idx.FindDataRefsScoped(name, "")
-}
-
-// FindDataRefsScoped is FindDataRefs with optional in-PROC narrowing.
-func (idx *Index) FindDataRefsScoped(name, inProc string) []*RefEntry {
+// understanding how a data symbol is read or written.
+//
+// Scope rules: when the queried name is declared as a global symbol
+// (PROC, export, global, EQU, data, MACRO) anywhere in the project,
+// only non-local refs are returned. When the name is declared *only* as
+// a local (`@@Foo` inside one or more PROCs), only @@-prefixed refs are
+// returned -- and an inProc filter narrows further if requested. Pass
+// `""` for inProc when no PROC narrowing is wanted.
+func (idx *Index) FindDataRefs(name, inProc string) []*RefEntry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	hasGlobalDecl := false
@@ -336,17 +336,12 @@ func (idx *Index) FindDataRefsScoped(name, inProc string) []*RefEntry {
 // (PROC, export, global, EQU) anywhere in the project, only non-local
 // references are returned. When the name is declared *only* as a local
 // (`@@Foo` inside one or more PROCs), only @@-prefixed references are
-// returned -- and an in_proc filter narrows further if requested.
+// returned -- and an inProc filter narrows further if requested. Pass
+// `""` for inProc when no PROC narrowing is wanted.
 //
 // This prevents `find_callers("Done")` from drowning the agent in 1,400+
 // hits across every PROC that has its own `@@Done` label.
-func (idx *Index) FindCallers(name string) []*RefEntry {
-	return idx.FindCallersScoped(name, "")
-}
-
-// FindCallersScoped is FindCallers with an optional enclosing-PROC filter
-// for queries about local labels.
-func (idx *Index) FindCallersScoped(name, inProc string) []*RefEntry {
+func (idx *Index) FindCallers(name, inProc string) []*RefEntry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	hasGlobalDecl := false
@@ -378,17 +373,7 @@ func (idx *Index) FindCallersScoped(name, inProc string) []*RefEntry {
 	return out
 }
 
-// FindCallees returns control-transfer refs WITHIN the given PROC, with each
-// (target,kind) pair de-duplicated. External and internal jumps are mixed.
-// Most callers want FindCalleesScoped instead.
-func (idx *Index) FindCallees(procName string) []*RefEntry {
-	ext, intl := idx.FindCalleesScoped(procName)
-	out := append([]*RefEntry{}, ext...)
-	out = append(out, intl...)
-	return out
-}
-
-// FindCalleesScoped returns external and internal callees separately:
+// FindCallees returns external and internal callees of the given PROC:
 //
 //   - external: cross-PROC `call` and `jmp` targets (the actual outgoing
 //     edges of the call graph)
@@ -397,7 +382,7 @@ func (idx *Index) FindCallees(procName string) []*RefEntry {
 //
 // Each list is deduped by (target,kind). Returns nil,nil if procName is not
 // a known PROC.
-func (idx *Index) FindCalleesScoped(procName string) (external, internal []*RefEntry) {
+func (idx *Index) FindCallees(procName string) (external, internal []*RefEntry) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if _, ok := idx.Procs[procName]; !ok {

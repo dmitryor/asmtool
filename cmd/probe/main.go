@@ -147,11 +147,11 @@ func runFullIndex(dir, root, jwasmBin string) {
 			fmt.Printf("  %-30s NOT FOUND\n", name)
 			continue
 		}
-		callers := idx.FindCallers(name)
-		callees := idx.FindCallees(name)
+		callers := idx.FindCallers(name, "")
+		ext, intl := idx.FindCallees(name)
 		fmt.Printf("  %-30s addr=%04x file=%s lines=%d..%d callers=%d callees=%d\n",
 			name, ent.Addr, filepath.Base(ent.File), ent.StartLine, ent.EndLine,
-			len(callers), len(callees))
+			len(callers), len(ext)+len(intl))
 	}
 
 	for _, addr := range []uint32{0x0000, 0x022e, 0xa17c, 0xb048} {

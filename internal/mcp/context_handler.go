@@ -65,7 +65,7 @@ func buildFunctionContext(idx *index.Index, name string, ctxLines int) (function
 		res.Body = body
 	}
 
-	callers := idx.FindCallers(name)
+	callers := idx.FindCallers(name, "")
 	res.CallerCount = len(callers)
 	for _, c := range callers {
 		surr := surroundingLines(idx, c.File, c.Line, ctxLines)
@@ -79,7 +79,7 @@ func buildFunctionContext(idx *index.Index, name string, ctxLines int) (function
 		})
 	}
 
-	external, internal := idx.FindCalleesScoped(name)
+	external, internal := idx.FindCallees(name)
 	res.ExternalCount = len(external)
 	res.InternalJumpCount = len(internal)
 	for _, c := range external {

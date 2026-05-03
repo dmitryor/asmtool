@@ -91,22 +91,7 @@ func (idx *Index) FindEquAliasesOf(name string) []*SymbolEntry {
 func (idx *Index) HostInstruction(anchor *SymbolEntry) string {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	f := idx.Files[anchor.File]
-	if f == nil || anchor.Line < 1 || anchor.Line > len(f.Lines) {
-		return ""
-	}
-	line := stripInlineComment(f.Lines[anchor.Line-1])
-	if instr := afterLabel(line, anchor.Name); instr != "" {
-		return strings.TrimSpace(instr)
-	}
-	for i := anchor.Line; i < len(f.Lines); i++ {
-		next := strings.TrimSpace(stripInlineComment(f.Lines[i]))
-		if next == "" {
-			continue
-		}
-		return next
-	}
-	return ""
+	return idx.hostInstructionLocked(anchor)
 }
 
 func stripInlineComment(line string) string {
@@ -141,7 +126,6 @@ type SmcSite struct {
 	Var             *SymbolEntry // var alias whose slot the address hits (nil if the addr is the anchor itself)
 	Slot            SmcSlot      // populated when Var != nil
 	HostInstruction string       // source line of the patched instruction
-	SlotAddrOffset  int          // byte offset of the queried addr relative to the anchor
 }
 
 // SmcSiteAt returns the SMC site that covers the given byte address, if
@@ -162,7 +146,6 @@ func (idx *Index) SmcSiteAt(addr uint32) *SmcSite {
 	var bestVar *SymbolEntry
 	var bestAnchor *SymbolEntry
 	var bestSlot SmcSlot
-	var bestOffset int
 	for _, decls := range idx.Symbols {
 		for _, s := range decls {
 			if s.Kind != "EQU" || s.Text == "" {
@@ -186,7 +169,6 @@ func (idx *Index) SmcSiteAt(addr uint32) *SmcSite {
 			bestVar = s
 			bestAnchor = anchor
 			bestSlot = slot
-			bestOffset = slot.Offset
 			break
 		}
 		if bestVar != nil {
@@ -216,10 +198,9 @@ func (idx *Index) SmcSiteAt(addr uint32) *SmcSite {
 		return nil
 	}
 	site := &SmcSite{
-		Anchor:         bestAnchor,
-		Var:            bestVar,
-		Slot:           bestSlot,
-		SlotAddrOffset: bestOffset,
+		Anchor: bestAnchor,
+		Var:    bestVar,
+		Slot:   bestSlot,
 	}
 	site.HostInstruction = idx.HostInstruction(bestAnchor)
 	return site
@@ -262,10 +243,7 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 	defer idx.mu.RUnlock()
 
 	// Collect every SmcAnchor_* with a known address.
-	type anchorRow struct {
-		entry *SymbolEntry
-	}
-	var anchors []anchorRow
+	var anchors []*SymbolEntry
 	for name, decls := range idx.Symbols {
 		if !strings.HasPrefix(name, "SmcAnchor_") {
 			continue
@@ -277,11 +255,11 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 			if fileFilter != "" && s.File != fileFilter {
 				continue
 			}
-			anchors = append(anchors, anchorRow{entry: s})
+			anchors = append(anchors, s)
 		}
 	}
 	sort.Slice(anchors, func(i, j int) bool {
-		return anchors[i].entry.Addr < anchors[j].entry.Addr
+		return anchors[i].Addr < anchors[j].Addr
 	})
 
 	// Build a reverse map anchor name -> var alias (first one wins; usually
@@ -310,33 +288,33 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 	var clusters []*SmcCluster
 	var cur *SmcCluster
 	procSeen := map[string]bool{}
-	for i, a := range anchors {
+	for _, a := range anchors {
 		startNew := cur == nil ||
-			cur.File != a.entry.File ||
-			a.entry.Addr-cur.EndAddr > maxGap
+			cur.File != a.File ||
+			a.Addr-cur.EndAddr > maxGap
 		if startNew {
 			if cur != nil && len(cur.Anchors) >= minSize {
 				clusters = append(clusters, cur)
 			}
 			cur = &SmcCluster{
-				File:      a.entry.File,
-				StartAddr: a.entry.Addr,
+				File:      a.File,
+				StartAddr: a.Addr,
 			}
 			procSeen = map[string]bool{}
 		}
 		ref := SmcAnchorRef{
-			Anchor:    a.entry,
-			HostInstr: idx.hostInstructionLocked(a.entry),
+			Anchor:    a,
+			HostInstr: idx.hostInstructionLocked(a),
 		}
-		if v, ok := varOf[a.entry.Name]; ok {
+		if v, ok := varOf[a.Name]; ok {
 			ref.Var = v
-			ref.Slot = slotOf[a.entry.Name]
+			ref.Slot = slotOf[a.Name]
 			// Record writer PROCs for cluster summary.
 			for _, r := range idx.Refs[v.Name] {
 				if r.Kind != "mem" {
 					continue
 				}
-				access := classifyAccessLocked(r)
+				access := ClassifyAccess(r)
 				if access != "write" && access != "rw" {
 					continue
 				}
@@ -348,8 +326,7 @@ func (idx *Index) SmcClusters(fileFilter string, maxGap uint32, minSize int) []*
 			}
 		}
 		cur.Anchors = append(cur.Anchors, ref)
-		cur.EndAddr = a.entry.Addr
-		_ = i
+		cur.EndAddr = a.Addr
 	}
 	if cur != nil && len(cur.Anchors) >= minSize {
 		clusters = append(clusters, cur)
@@ -656,15 +633,7 @@ type MirrorWriteGroup struct {
 	Source    string
 	LineStart int
 	LineEnd   int
-	Writes    []MirrorWrite
-}
-
-// MirrorWrite is one mem-write ref inside a MirrorWriteGroup.
-type MirrorWrite struct {
-	Target string // the destination symbol (the patched SMC slot's var name)
-	File   string
-	Line   int
-	Text   string
+	Writes    []*RefEntry
 }
 
 // FindMirrorWrites returns groups of consecutive memory-write refs
@@ -717,7 +686,6 @@ func (idx *Index) FindMirrorWrites(proc string, maxLineGap, minSize int) []Mirro
 	cur := MirrorWriteGroup{}
 	for _, w := range rows {
 		if w.source == "" {
-			// flush current
 			if len(cur.Writes) >= minSize {
 				groups = append(groups, cur)
 			}
@@ -733,12 +701,7 @@ func (idx *Index) FindMirrorWrites(proc string, maxLineGap, minSize int) []Mirro
 			}
 			cur = MirrorWriteGroup{Source: w.source, LineStart: w.ref.Line, LineEnd: w.ref.Line}
 		}
-		cur.Writes = append(cur.Writes, MirrorWrite{
-			Target: w.ref.Target,
-			File:   w.ref.File,
-			Line:   w.ref.Line,
-			Text:   w.ref.Text,
-		})
+		cur.Writes = append(cur.Writes, w.ref)
 		cur.LineEnd = w.ref.Line
 	}
 	if len(cur.Writes) >= minSize {
@@ -1135,9 +1098,3 @@ func (idx *Index) hostInstructionLocked(anchor *SymbolEntry) string {
 	return ""
 }
 
-// classifyAccessLocked mirrors ClassifyAccess but is callable from code
-// already holding idx.mu (ClassifyAccess takes no lock currently, but if it
-// later does we want a stable lock-free version for cluster scans).
-func classifyAccessLocked(r *RefEntry) string {
-	return ClassifyAccess(r)
-}
