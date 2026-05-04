@@ -174,6 +174,84 @@ func TestIsSubstantiveComment_PlaceholderTodos(t *testing.T) {
 	}
 }
 
+func TestAuditSummary(t *testing.T) {
+	// Build a fixture with: 1 missing-header PROC (c4 fail), 1 magic
+	// immediate without annotation (c5 fail), 1 uncovered external xref
+	// (c6 fail), 1 PROC pair with wrong spacing (c10 fail).
+	srcFile := "x.inc"
+	otherFile := "other.inc"
+	lines := []string{
+		"ProcA PROC NEAR",          // 1 -- header is missing
+		"    mov ax, 0x3fff",       // 2 -- c5: magic, no annotation
+		"    call OtherProc",       // 3 -- c6: external xref, no annotation
+		"ProcA ENDP",               // 4
+		"",                          // 5
+		"",                          // 6 (2 blank lines, expected 1 -> c10 fail)
+		"; trivial helper",         // 7
+		"ProcB PROC NEAR",          // 8
+		"    ret",                  // 9
+		"ProcB ENDP",               // 10
+	}
+	otherLines := []string{
+		"OtherProc PROC NEAR",
+		"    ret",
+		"OtherProc ENDP",
+	}
+	idx := &Index{
+		Files: map[string]*source.File{
+			srcFile:   {Path: srcFile, Lines: lines},
+			otherFile: {Path: otherFile, Lines: otherLines},
+		},
+		Procs: map[string]*ProcEntry{
+			"ProcA":     {Name: "ProcA", File: srcFile, StartLine: 1, EndLine: 4},
+			"ProcB":     {Name: "ProcB", File: srcFile, StartLine: 8, EndLine: 10},
+			"OtherProc": {Name: "OtherProc", File: otherFile, StartLine: 1, EndLine: 3},
+		},
+		Symbols: map[string][]*SymbolEntry{
+			"OtherProc": {{Name: "OtherProc", Kind: "PROC", File: otherFile, Line: 1}},
+		},
+		Refs: map[string][]*RefEntry{
+			"OtherProc": {{
+				Target: "OtherProc", Kind: "call",
+				File: srcFile, Line: 3, EnclosingProc: "ProcA",
+				Text: "    call OtherProc",
+			}},
+		},
+	}
+	s := idx.AuditSummaryFor(srcFile, nil)
+	if s.C4Total != 2 {
+		t.Errorf("c4_total: %d, want 2", s.C4Total)
+	}
+	if s.C4Fail != 1 {
+		t.Errorf("c4_fail: %d, want 1 (ProcA missing header)", s.C4Fail)
+	}
+	if s.C5Fail != 1 {
+		t.Errorf("c5_fail: %d, want 1 (0x3fff unannotated)", s.C5Fail)
+	}
+	if s.C6Fail != 1 || s.C6ExtTotal != 1 {
+		t.Errorf("c6: fail=%d ext_total=%d, want 1/1", s.C6Fail, s.C6ExtTotal)
+	}
+	if s.C10Total != 1 || s.C10Fail != 1 {
+		t.Errorf("c10: fail=%d total=%d, want 1/1 (2 blanks vs expected 1)", s.C10Fail, s.C10Total)
+	}
+	// Criteria filter: only c5
+	s = idx.AuditSummaryFor(srcFile, []string{"c5"})
+	if s.C4Total != 0 || s.C6ExtTotal != 0 || s.C10Total != 0 {
+		t.Errorf("c5-only filter leaked other criteria: %+v", s)
+	}
+	if s.C5Fail != 1 {
+		t.Errorf("c5-only filter dropped c5: %+v", s)
+	}
+	// Whole-corpus mode
+	all := idx.AuditSummaryAll(nil)
+	if len(all) != 2 {
+		t.Errorf("AuditSummaryAll: got %d, want 2 (sorted: other.inc, x.inc)", len(all))
+	}
+	if all[0].File != "other.inc" || all[1].File != "x.inc" {
+		t.Errorf("AuditSummaryAll order: %v", []string{all[0].File, all[1].File})
+	}
+}
+
 func TestProcHeaderCardCoverage_PlaceholderOneLiner(t *testing.T) {
 	file := "x.inc"
 	lines := make([]string, 12)

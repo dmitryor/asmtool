@@ -725,6 +725,137 @@ func readDeclPreamble(lines []string, line int) (string, bool) {
 	return strings.Join(parts, "\n") + "\n", true
 }
 
+// ----- audit_summary -----
+
+// AuditSummary is the small counts-only payload that drives the project's
+// between-round re-baseline. Each criterion has a fail count plus a total
+// (or per-criterion-specific scope total). Counts encode the failure
+// rules from the consumer (quality_audit.py) so consumers don't have to
+// pull every detail record back through the agent's context.
+//
+// Codified failure rules:
+//
+//   c4 (proc_header_card_coverage) - fail when header_kind is missing or
+//      legacy_banner, or when a structured card lacks a purpose line.
+//      Total = number of PROCs in the file.
+//
+//   c5 (magic_immediate_scan) - fail when an item has no substantive
+//      annotation, no EQU match, AND is not in an excluded class.
+//      Total = number of items.
+//
+//   c6 (xref_coverage) - fail when an external (non-indirect) xref has
+//      neither inline nor target-declaration annotation. Total = number
+//      of external (non-indirect) xrefs (not raw item count).
+//
+//   c10 (proc_spacing) - fail when blank_lines_between != 1. Total =
+//      number of consecutive PROC pairs.
+type AuditSummary struct {
+	File       string
+	C4Fail     int
+	C4Total    int
+	C5Fail     int
+	C5Total    int
+	C6Fail     int
+	C6ExtTotal int
+	C10Fail    int
+	C10Total   int
+}
+
+// AuditSummaryFor returns the per-criterion fail/total counts for one
+// module. `criteria` is the subset to compute (empty = all). Unknown
+// criterion tokens are ignored.
+func (idx *Index) AuditSummaryFor(file string, criteria []string) AuditSummary {
+	idx.mu.RLock()
+	_, ok := idx.Files[file]
+	idx.mu.RUnlock()
+	if !ok {
+		return AuditSummary{File: filepath.Base(file)}
+	}
+	want := map[string]bool{}
+	if len(criteria) == 0 {
+		want = map[string]bool{"c4": true, "c5": true, "c6": true, "c10": true}
+	} else {
+		for _, c := range criteria {
+			want[strings.TrimSpace(c)] = true
+		}
+	}
+	out := AuditSummary{File: filepath.Base(file)}
+	if want["c4"] {
+		cards := idx.ProcHeaderCardCoverage(file, "")
+		out.C4Total = len(cards)
+		for _, c := range cards {
+			if c.HeaderKind == HeaderMissing || c.HeaderKind == HeaderLegacyBanner {
+				out.C4Fail++
+				continue
+			}
+			if c.HeaderKind == HeaderStructured && hasNoPurposeIssue(c.Issues) {
+				out.C4Fail++
+			}
+		}
+	}
+	if want["c5"] {
+		hits := idx.MagicImmediateScan(file, "", 0x100)
+		out.C5Total = len(hits)
+		for _, h := range hits {
+			if !h.HasSubstantiveAnnotation && h.EquSymbol == "" && !h.IsExcluded {
+				out.C5Fail++
+			}
+		}
+	}
+	if want["c6"] {
+		xrefs := idx.XrefCoverageScan(file, "", nil)
+		for _, x := range xrefs {
+			if !x.ExternalToModule || x.TargetKind == "indirect" {
+				continue
+			}
+			out.C6ExtTotal++
+			if !x.InlineIsSubstantive && !x.TargetIsSubstantive {
+				out.C6Fail++
+			}
+		}
+	}
+	if want["c10"] {
+		pairs := idx.ProcSpacing(file)
+		out.C10Total = len(pairs)
+		for _, p := range pairs {
+			if p.BlankLines != 1 {
+				out.C10Fail++
+			}
+		}
+	}
+	return out
+}
+
+// AuditSummaryAll returns one AuditSummary per source file currently
+// indexed. Useful for whole-corpus re-baselines without a per-module
+// loop on the consumer side. Files are returned sorted by basename for
+// stable output.
+func (idx *Index) AuditSummaryAll(criteria []string) []AuditSummary {
+	idx.mu.RLock()
+	paths := make([]string, 0, len(idx.Files))
+	for p := range idx.Files {
+		paths = append(paths, p)
+	}
+	idx.mu.RUnlock()
+	sort.Slice(paths, func(i, j int) bool {
+		return filepath.Base(paths[i]) < filepath.Base(paths[j])
+	})
+	out := make([]AuditSummary, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, idx.AuditSummaryFor(p, criteria))
+	}
+	return out
+}
+
+func hasNoPurposeIssue(issues []string) bool {
+	for _, i := range issues {
+		if strings.Contains(i, "no purpose") {
+			return true
+		}
+	}
+	return false
+}
+
 // stripCommentPrefixes removes the leading `;` (and any spaces after it)
 // from each line of a joined preamble block, so isSubstantiveComment
 // can evaluate it against the same heuristic used for inline comments.

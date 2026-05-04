@@ -68,6 +68,11 @@ Quality-audit primitives (consumed by `quality_audit.py`):
   xrefs with inline-annotation status AND target-declaration
   preamble (the comment block above where the target symbol is
   declared). Covered when either is substantive (criterion 6).
+- `audit_summary(file?, criteria?)` — counts-only aggregator that
+  applies the c4/c5/c6/c10 failure rules server-side and returns one
+  small JSON object per module (or all modules when `file` is
+  omitted). ~33× cheaper than calling the four detail tools for
+  between-round re-baselines.
 
 Composite:
 

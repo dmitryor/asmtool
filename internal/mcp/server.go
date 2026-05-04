@@ -245,6 +245,14 @@ func (s *Server) registerTools(srv *server.MCPServer) {
 			mcp.Description("Minimum immediate value to report (default 0x100)")),
 	), s.handleMagicImmediateScan)
 
+	srv.AddTool(mcp.NewTool("audit_summary",
+		mcp.WithDescription("Counts-only audit aggregator. For one module (or every indexed module when `file` is omitted), returns per-criterion fail/total counts {c4, c5, c6, c10} computed by applying the consumer's failure rules server-side. ~33x token reduction vs calling the four detail endpoints. Use this for between-round re-baselines; use the per-criterion tools for ticket-level drill-down."),
+		mcp.WithString("file",
+			mcp.Description("Source file (basename or absolute). Omit for whole-corpus mode (one record per indexed .inc).")),
+		mcp.WithString("criteria",
+			mcp.Description("Comma-separated subset of [c4, c5, c6, c10] (default: all four)")),
+	), s.handleAuditSummary)
+
 	srv.AddTool(mcp.NewTool("xref_coverage",
 		mcp.WithDescription("Quality-audit primitive (criterion 6). Enumerate cross-references in a module (call / jmp / mem_read / mem_write). For each site, reports inline-annotation status (the `;` comment on the call line) AND target-declaration-annotation status (the preamble comment block immediately above the target symbol's declaration). A site is covered when either is substantive."),
 		mcp.WithString("file", mcp.Required()),
@@ -1028,6 +1036,48 @@ func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) 
 		res["note"] = "no symbols declared in this byte range -- check the addr or pass a wider size"
 	}
 	return jsonText(res), nil
+}
+
+// handleAuditSummary aggregates the four audit primitives into per-module
+// fail/total counts. Whole-corpus mode kicks in when `file` is omitted.
+func (s *Server) handleAuditSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	file := req.GetString("file", "")
+	criteriaCSV := req.GetString("criteria", "")
+	var criteria []string
+	if criteriaCSV != "" {
+		for _, c := range strings.Split(criteriaCSV, ",") {
+			if t := strings.TrimSpace(c); t != "" {
+				criteria = append(criteria, t)
+			}
+		}
+	}
+	idx := s.Index()
+	asMap := func(a index.AuditSummary) map[string]any {
+		return map[string]any{
+			"file":         a.File,
+			"c4_fail":      a.C4Fail,
+			"c4_total":     a.C4Total,
+			"c5_fail":      a.C5Fail,
+			"c5_total":     a.C5Total,
+			"c6_fail":      a.C6Fail,
+			"c6_ext_total": a.C6ExtTotal,
+			"c10_fail":     a.C10Fail,
+			"c10_total":    a.C10Total,
+		}
+	}
+	if file == "" {
+		all := idx.AuditSummaryAll(criteria)
+		out := make([]map[string]any, 0, len(all))
+		for _, a := range all {
+			out = append(out, asMap(a))
+		}
+		return jsonText(map[string]any{
+			"modules": out,
+			"count":   len(out),
+		}), nil
+	}
+	abs := s.resolveFile(file)
+	return jsonText(asMap(idx.AuditSummaryFor(abs, criteria))), nil
 }
 
 // handleProcSpacing returns blank-line counts between consecutive PROCs.
