@@ -49,30 +49,6 @@ Read-only navigation:
   PROC, return groups of consecutive memory-writes whose source
   operand is identical. Catches the `ComputeViewMatrix` shape (one
   computed value broadcast to N SMC slots back-to-back).
-- `var_annotation(name)` — read the project annotation JSON
-  (configured via `annotation_path` in `.jwasm-mcp.toml`) and return
-  the entry for `name` merged with live SMC slot metadata. The
-  rename-phase companion to `rename_symbol`.
-
-Quality-audit primitives (consumed by `quality_audit.py`):
-
-- `proc_spacing(file)` — blank-line counts between consecutive
-  ENDP→PROC pairs (criterion 10).
-- `proc_header_card_coverage(file, proc?)` — classify each PROC's
-  preamble as `structured` / `one_liner` / `legacy_banner` /
-  `missing` (criterion 4).
-- `magic_immediate_scan(file, proc?, min_value?)` — every immediate
-  ≥ `min_value` (default 0x100) with annotation status, EQU match,
-  and excluded-class reasoning (criterion 5).
-- `xref_coverage(file, proc?, kinds?)` — call/jmp/mem_read/mem_write
-  xrefs with inline-annotation status AND target-declaration
-  preamble (the comment block above where the target symbol is
-  declared). Covered when either is substantive (criterion 6).
-- `audit_summary(file?, criteria?)` — counts-only aggregator that
-  applies the c4/c5/c6/c10 failure rules server-side and returns one
-  small JSON object per module (or all modules when `file` is
-  omitted). ~33× cheaper than calling the four detail tools for
-  between-round re-baselines.
 
 Composite:
 

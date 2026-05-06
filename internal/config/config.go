@@ -15,12 +15,7 @@ type Config struct {
 	Jwasm       string   `toml:"jwasm"`
 	Verify      string   `toml:"verify"`
 	CacheDir    string   `toml:"cache_dir"`
-	// AnnotationPath, when set, points at a JSON file mapping symbol
-	// names to project-specific annotation entries. The var_annotation
-	// MCP tool surfaces those entries (merged with live slot metadata).
-	// Path is resolved relative to ProjectRoot when not absolute.
-	AnnotationPath string `toml:"annotation_path"`
-	ProjectRoot    string `toml:"-"`
+	ProjectRoot string   `toml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -60,9 +55,6 @@ func Load(path string) (*Config, error) {
 		if !filepath.IsAbs(p) {
 			c.DocPaths[i] = filepath.Join(c.ProjectRoot, p)
 		}
-	}
-	if c.AnnotationPath != "" && !filepath.IsAbs(c.AnnotationPath) {
-		c.AnnotationPath = filepath.Join(c.ProjectRoot, c.AnnotationPath)
 	}
 	return c, nil
 }
