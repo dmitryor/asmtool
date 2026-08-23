@@ -1,6 +1,5 @@
-// Package index combines the source-file parses and the JWasm listing-derived
-// symbol table into a single in-memory query model. All MCP tools resolve
-// against an Index instance.
+// Package index combines parsed source with a JWasm listing-derived symbol
+// table in one query model.
 package index
 
 import (
@@ -11,11 +10,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
-	"github.com/orlovsky/jwasm-mcp/internal/source"
+	"github.com/dmitryor/asmtool/internal/jwasm"
+	"github.com/dmitryor/asmtool/internal/source"
 )
 
-// SymbolEntry is the unified record returned to MCP queries: it merges
+// SymbolEntry is the unified declaration record: it merges
 // what the source parser saw (declaration site, kind, scope) with what
 // JWasm resolved (address, segment).
 type SymbolEntry struct {

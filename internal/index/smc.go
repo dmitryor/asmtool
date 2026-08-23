@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
+	"github.com/dmitryor/asmtool/internal/jwasm"
 )
 
 // SmcSlot describes the location and shape of a self-modifying-code slot:
@@ -218,11 +218,11 @@ type SmcAnchorRef struct {
 // each other in CSEG to be treated as a single SMC pattern -- typically a
 // triple of consecutive immediates patched together by one writer PROC.
 type SmcCluster struct {
-	File       string         // source file the anchors live in
-	Anchors    []SmcAnchorRef // sorted by anchor address ascending
-	StartAddr  uint32
-	EndAddr    uint32 // address of the last anchor (not the byte after)
-	Procs      []string       // distinct PROCs that write to any var in the cluster
+	File      string         // source file the anchors live in
+	Anchors   []SmcAnchorRef // sorted by anchor address ascending
+	StartAddr uint32
+	EndAddr   uint32   // address of the last anchor (not the byte after)
+	Procs     []string // distinct PROCs that write to any var in the cluster
 }
 
 // SmcClusters groups SMC anchors by spatial proximity. Two consecutive
@@ -998,4 +998,3 @@ func (idx *Index) hostInstructionLocked(anchor *SymbolEntry) string {
 	}
 	return ""
 }
-

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/orlovsky/jwasm-mcp/internal/index"
+	"github.com/dmitryor/asmtool/internal/index"
 )
 
 // Confidence levels for the classifier output.
@@ -49,9 +49,9 @@ type Candidate struct {
 	Text          string     `json:"text"`
 }
 
-// CSEGUpper bounds the address space we treat as in-segment. The retaliator
-// CSEG ends at 0x10000 with DSEG starting at paragraph 0x1000. Literals at
-// or above this are very unlikely to be CS addresses.
+// CSEGUpper bounds the address space we treat as in-segment for a typical
+// 16-bit real-mode image (64KiB code segment). Literals at or above this
+// are very unlikely to be CS addresses.
 const CSEGUpper = 0x10000
 
 // CSEGLower below this we ignore matches: small literals (0..0xff) are
@@ -250,8 +250,8 @@ var regNames = map[string]bool{
 // Memory-operand classification is two-tier:
 //   - "mem"      → `[imm]` with no register inside the brackets (absolute)
 //   - "mem_disp" → `[reg + imm]` / `[reg - imm]` (base-displacement; the
-//                  literal is a field offset, not an address; usually NOT
-//                  a relocation blocker)
+//     literal is a field offset, not an address; usually NOT
+//     a relocation blocker)
 //
 // To detect this we mark the start of each `[...]` and then, when we close
 // it, look back at whether any register name appeared inside.

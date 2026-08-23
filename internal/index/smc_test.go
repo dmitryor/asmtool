@@ -3,8 +3,8 @@ package index
 import (
 	"testing"
 
-	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
-	"github.com/orlovsky/jwasm-mcp/internal/source"
+	"github.com/dmitryor/asmtool/internal/jwasm"
+	"github.com/dmitryor/asmtool/internal/source"
 )
 
 // fixtureWithInstructions augments buildSmcFixture with a synthetic
@@ -670,10 +670,10 @@ func TestParseSmcEqu(t *testing.T) {
 		{"byte ptr Foo + 0", true, "byte", "Foo", 0},
 		// Negatives
 		{"0FFh", false, "", "", 0},
-		{"byte SmcAnchor_x", false, "", "", 0},        // missing 'ptr'
-		{"qword ptr SmcAnchor_x", false, "", "", 0},   // unsupported size
-		{"byte ptr Foo - 1", false, "", "", 0},        // we don't model subtraction
-		{"byte ptr Foo + bar", false, "", "", 0},      // non-numeric offset
+		{"byte SmcAnchor_x", false, "", "", 0},      // missing 'ptr'
+		{"qword ptr SmcAnchor_x", false, "", "", 0}, // unsupported size
+		{"byte ptr Foo - 1", false, "", "", 0},      // we don't model subtraction
+		{"byte ptr Foo + bar", false, "", "", 0},    // non-numeric offset
 	}
 	for _, c := range cases {
 		slot, ok := ParseSmcEqu(c.text)

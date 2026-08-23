@@ -51,7 +51,7 @@ func TestClassifyAccess(t *testing.T) {
 
 func TestSplitOperands(t *testing.T) {
 	cases := []struct {
-		text          string
+		text           string
 		mnem, dst, src string
 	}{
 		{"mov ax, bx", "mov", "ax", "bx"},

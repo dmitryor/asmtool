@@ -3,8 +3,8 @@ package index
 import (
 	"fmt"
 
-	"github.com/orlovsky/jwasm-mcp/internal/jwasm"
-	"github.com/orlovsky/jwasm-mcp/internal/source"
+	"github.com/dmitryor/asmtool/internal/jwasm"
+	"github.com/dmitryor/asmtool/internal/source"
 )
 
 // BuildFromConfig is the orchestration entrypoint: it walks the configured
@@ -23,11 +23,11 @@ type BuildInput struct {
 
 // BuildResult bundles the index with diagnostic output from the build.
 type BuildResult struct {
-	Index   *Index
-	Listing *jwasm.ListingFile
-	Run     jwasm.RunResult
+	Index    *Index
+	Listing  *jwasm.ListingFile
+	Run      jwasm.RunResult
 	NumFiles int
-	Err     error
+	Err      error
 }
 
 func BuildFromInput(in BuildInput) BuildResult {

@@ -13,9 +13,9 @@ type Config struct {
 	SourcePaths []string `toml:"source_paths"`
 	DocPaths    []string `toml:"doc_paths"`
 	Jwasm       string   `toml:"jwasm"`
-	Verify      string   `toml:"verify"`
 	CacheDir    string   `toml:"cache_dir"`
 	ProjectRoot string   `toml:"-"`
+	Path        string   `toml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -28,11 +28,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", abs, err)
 	}
 	c.ProjectRoot = filepath.Dir(abs)
+	c.Path = abs
 	if c.Jwasm == "" {
 		c.Jwasm = "jwasm"
 	}
 	if c.CacheDir == "" {
-		c.CacheDir = ".jwasm-mcp-cache"
+		c.CacheDir = ".asmtool-cache"
 	}
 	if !filepath.IsAbs(c.CacheDir) {
 		c.CacheDir = filepath.Join(c.ProjectRoot, c.CacheDir)

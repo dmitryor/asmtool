@@ -71,19 +71,19 @@ func TestParseInstructionRow(t *testing.T) {
 			wantText:  "mov     dx, ds:[2]                      ; 0002  PSP_TOP",
 		},
 		{
-			name:      "label_only_rejected",
-			line:      "0000BE4C                      C         SmcAnchor_be4c::",
-			wantOK:    false,
+			name:   "label_only_rejected",
+			line:   "0000BE4C                      C         SmcAnchor_be4c::",
+			wantOK: false,
 		},
 		{
-			name:      "comment_only_rejected",
-			line:      "                              C ; this is a comment",
-			wantOK:    false,
+			name:   "comment_only_rejected",
+			line:   "                              C ; this is a comment",
+			wantOK: false,
 		},
 		{
-			name:      "equ_row_rejected",
-			line:      " = byte ptr SmcAnchor_b47e +  C Var_b47f                equ byte ptr SmcAnchor_b47e + 1",
-			wantOK:    false,
+			name:   "equ_row_rejected",
+			line:   " = byte ptr SmcAnchor_b47e +  C Var_b47f                equ byte ptr SmcAnchor_b47e + 1",
+			wantOK: false,
 		},
 	}
 	for _, c := range cases {

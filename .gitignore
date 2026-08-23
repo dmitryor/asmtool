@@ -2,15 +2,17 @@
 .claude/settings.local.json
 
 # Build artifacts
-/jwasm-mcp
-/listcheck
-/probe
+/asmtool
 *.exe
 *.test
 *.out
 
-# Project cache (per .jwasm-mcp.toml)
-.jwasm-mcp-cache/
+# Project cache
+.asmtool-cache/
+
+# Secrets
+.env
+.env.*
 
 # Editor / OS
 .vscode/

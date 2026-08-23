@@ -11,15 +11,15 @@ import (
 type SymbolKind int
 
 const (
-	SymUnknown SymbolKind = iota
-	SymNumber             // bare numeric EQU (Number)
-	SymByte               // Byte-typed label in segment
-	SymWord               // Word-typed label in segment
-	SymDword              // Dword-typed label
-	SymLabelNear          // L Near
-	SymLabelFar           // L Far
-	SymProc               // Proc
-	SymText               // Text equate (expression-valued EQU)
+	SymUnknown   SymbolKind = iota
+	SymNumber               // bare numeric EQU (Number)
+	SymByte                 // Byte-typed label in segment
+	SymWord                 // Word-typed label in segment
+	SymDword                // Dword-typed label
+	SymLabelNear            // L Near
+	SymLabelFar             // L Far
+	SymProc                 // Proc
+	SymText                 // Text equate (expression-valued EQU)
 )
 
 func (k SymbolKind) String() string {
@@ -362,4 +362,3 @@ func parseHexVal(s string) (uint32, bool) {
 	}
 	return uint32(v), true
 }
-

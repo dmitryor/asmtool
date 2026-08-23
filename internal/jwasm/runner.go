@@ -17,16 +17,21 @@ type RunResult struct {
 
 // Run invokes jwasm with -mz, listing, and binary output enabled.
 // rootAsm is the path to the master .asm file. cacheDir is where
-// retal.lst and retal.exe land. The cwd of the subprocess is set
-// to the directory containing rootAsm so that relative INCLUDE
+// the listing and executable are written. The cwd of the subprocess
+// is set to the directory containing rootAsm so that relative INCLUDE
 // directives resolve identically to a manual invocation.
 func Run(jwasmBin, rootAsm, cacheDir string) RunResult {
-	rootDir := filepath.Dir(rootAsm)
 	rootBase := filepath.Base(rootAsm)
 	stem := rootBase[:len(rootBase)-len(filepath.Ext(rootBase))]
 	lst := filepath.Join(cacheDir, stem+".lst")
 	exe := filepath.Join(cacheDir, stem+".exe")
+	return RunTo(jwasmBin, rootAsm, lst, exe)
+}
 
+// RunTo invokes JWasm and writes its listing and executable to explicit paths.
+func RunTo(jwasmBin, rootAsm, lst, exe string) RunResult {
+	rootDir := filepath.Dir(rootAsm)
+	rootBase := filepath.Base(rootAsm)
 	cmd := exec.Command(jwasmBin,
 		"-mz", "-nologo",
 		"-Fl="+lst,

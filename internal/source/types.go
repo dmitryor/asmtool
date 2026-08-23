@@ -50,15 +50,15 @@ type Label struct {
 type RefKind int
 
 const (
-	RefUnknown RefKind = iota
-	RefCall            // call X
-	RefJmp             // jmp X / j[cond] X
-	RefOffset          // offset X (address-as-value)
-	RefMem             // [X] / [X+N] / seg:[X] -- memory operand
-	RefDataWord        // dw X (one entry of a word data definition)
-	RefDataByte        // db X
-	RefDataDword       // dd X
-	RefImm             // mov reg, X -- immediate that resolves to a label
+	RefUnknown   RefKind = iota
+	RefCall              // call X
+	RefJmp               // jmp X / j[cond] X
+	RefOffset            // offset X (address-as-value)
+	RefMem               // [X] / [X+N] / seg:[X] -- memory operand
+	RefDataWord          // dw X (one entry of a word data definition)
+	RefDataByte          // db X
+	RefDataDword         // dd X
+	RefImm               // mov reg, X -- immediate that resolves to a label
 )
 
 func (k RefKind) String() string {
@@ -111,10 +111,10 @@ type Proc struct {
 
 // File is a parsed module file.
 type File struct {
-	Path    string
-	Lines   []string // 1-indexed via Lines[i-1]; raw source (with comments) for read_proc
-	Procs   []*Proc
-	Labels  []*Label // all top-level declarations (PROC, global, export, data, EQU, MACRO)
-	Refs    []*Ref
+	Path     string
+	Lines    []string // 1-indexed via Lines[i-1]; raw source (with comments) for read_proc
+	Procs    []*Proc
+	Labels   []*Label // all top-level declarations (PROC, global, export, data, EQU, MACRO)
+	Refs     []*Ref
 	Includes []string // include directives found, in declaration order
 }

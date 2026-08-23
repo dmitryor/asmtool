@@ -99,4 +99,3 @@ func mnemonicHasRule(m string) bool {
 	}
 	return false
 }
-

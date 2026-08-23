@@ -1,4 +1,4 @@
-package mcp
+package tool
 
 import (
 	"fmt"
@@ -6,16 +6,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orlovsky/jwasm-mcp/internal/index"
+	"github.com/dmitryor/asmtool/internal/index"
 )
 
 type callerSite struct {
-	File          string `json:"file"`
-	Line          int    `json:"line"`
-	Kind          string `json:"kind"`
-	InProc        string `json:"in_proc"`
-	Text          string `json:"text"`
-	Surrounding   string `json:"surrounding"`
+	File        string `json:"file"`
+	Line        int    `json:"line"`
+	Kind        string `json:"kind"`
+	InProc      string `json:"in_proc"`
+	Text        string `json:"text"`
+	Surrounding string `json:"surrounding"`
 }
 
 type calleeRef struct {
@@ -47,8 +47,7 @@ type functionContextResult struct {
 // buildFunctionContext is the composite query that goal 2 hangs on. It
 // returns body + callers (with a small surrounding-lines window) + callees
 // + sibling PROCs in the same module + @@-local labels declared inside.
-// One MCP round-trip should give the agent everything needed to make a
-// naming decision.
+// One command should give the caller everything needed for a naming decision.
 func buildFunctionContext(idx *index.Index, name string, ctxLines int) (functionContextResult, error) {
 	res := functionContextResult{Name: name}
 	p, ok := idx.Procs[name]

@@ -13,6 +13,9 @@
 //   - Collision refusal: if the target name already exists as a global
 //     declaration, the rename refuses (or, for locals, allows in PROCs
 //     where it doesn't collide).
+//   - Matching closers and comments: a PROC rename updates `Name ENDP`
+//     and free-form `; comments`, not just the PROC line and indexed
+//     instruction operands. String literals in code are left alone.
 //   - Dry-run preview: returns the exact (file, line, before, after)
 //     edit list before touching disk.
 package rename
@@ -24,8 +27,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orlovsky/jwasm-mcp/internal/index"
-	"github.com/orlovsky/jwasm-mcp/internal/source"
+	"github.com/dmitryor/asmtool/internal/index"
+	"github.com/dmitryor/asmtool/internal/source"
 )
 
 // Edit is one substitution about to be applied (or just previewed).
@@ -38,12 +41,43 @@ type Edit struct {
 
 // Plan is the dry-run preview returned by Plan and applied by Apply.
 type Plan struct {
-	OldName    string `json:"old"`
-	NewName    string `json:"new"`
-	IsLocal    bool   `json:"is_local"`     // rename is scoped to one PROC
-	InProc     string `json:"in_proc,omitempty"`
-	Edits      []Edit `json:"edits"`
-	FilesTouched int  `json:"files_touched"`
+	OldName      string `json:"old"`
+	NewName      string `json:"new"`
+	IsLocal      bool   `json:"is_local"` // rename is scoped to one PROC
+	InProc       string `json:"in_proc,omitempty"`
+	Edits        []Edit `json:"edits"`
+	FilesTouched int    `json:"files_touched"`
+}
+
+// CombinePlans merges independent rename previews into one write plan. This
+// preserves multiple substitutions that happen to share a source line.
+func CombinePlans(plans ...*Plan) *Plan {
+	combined := &Plan{}
+	byLocation := map[string]Edit{}
+	files := map[string]bool{}
+	for _, plan := range plans {
+		for _, edit := range plan.Edits {
+			key := fmt.Sprintf("%s:%d", edit.File, edit.Line)
+			if current, ok := byLocation[key]; ok {
+				current.After = rewriteLine(current.After, plan.OldName, plan.NewName, plan.IsLocal)
+				byLocation[key] = current
+			} else {
+				byLocation[key] = edit
+			}
+			files[edit.File] = true
+		}
+	}
+	for _, edit := range byLocation {
+		combined.Edits = append(combined.Edits, edit)
+	}
+	sort.Slice(combined.Edits, func(i, j int) bool {
+		if combined.Edits[i].File != combined.Edits[j].File {
+			return combined.Edits[i].File < combined.Edits[j].File
+		}
+		return combined.Edits[i].Line < combined.Edits[j].Line
+	})
+	combined.FilesTouched = len(files)
+	return combined
 }
 
 // Options controls what gets rewritten.
@@ -144,60 +178,38 @@ func PlanRename(idx *index.Index, oldName, newName string, opts Options) (*Plan,
 		InProc:  opts.InProc,
 	}
 
-	// Build the per-file line edits.
+	// Build the per-file line edits by scanning source ranges rather than
+	// only indexed decl/ref sites. The parser drops ENDP names and comment
+	// text, so a site list would miss `Foo ENDP` and `; see Foo`.
 	editsByFile := map[string][]Edit{}
-
-	// 1. Declaration sites.
-	for _, s := range declSyms {
-		if allLocal && opts.InProc != "" && s.EnclosingProc != opts.InProc {
+	seenLine := map[string]bool{}
+	for _, rg := range renameScanRanges(idx, declSyms, allLocal, opts.InProc) {
+		f := idx.Files[rg.file]
+		if f == nil {
 			continue
 		}
-		if opts.InProc != "" && hasGlobalDecl && s.EnclosingProc != opts.InProc {
-			// Global rename scoped to one PROC: only rename declarations
-			// inside that PROC. Realistically there's at most one match.
-			continue
+		end := rg.end
+		if end > len(f.Lines) {
+			end = len(f.Lines)
 		}
-		f := idx.Files[s.File]
-		if f == nil || s.Line <= 0 || s.Line > len(f.Lines) {
-			continue
-		}
-		before := f.Lines[s.Line-1]
-		after := rewriteLine(before, oldName, newName, s.Kind == "local")
-		if after == before {
-			continue
-		}
-		editsByFile[s.File] = append(editsByFile[s.File], Edit{File: s.File, Line: s.Line, Before: before, After: after})
-	}
-
-	// 2. Reference sites.
-	for _, r := range idx.FindRefs(oldName) {
-		// Local-only rename: skip refs outside the target PROC. Global
-		// rename: skip @@-prefixed refs (they aren't this symbol).
-		if allLocal {
-			if !r.IsLocal {
+		for line := rg.start; line <= end; line++ {
+			if line <= 0 {
 				continue
 			}
-			if opts.InProc != "" && r.EnclosingProc != opts.InProc {
+			key := fmt.Sprintf("%s:%d", rg.file, line)
+			if seenLine[key] {
 				continue
 			}
-		} else {
-			if r.IsLocal {
+			seenLine[key] = true
+			before := f.Lines[line-1]
+			after := rewriteLine(before, oldName, newName, allLocal)
+			if after == before {
 				continue
 			}
-			if opts.InProc != "" && r.EnclosingProc != opts.InProc {
-				continue
-			}
+			editsByFile[rg.file] = append(editsByFile[rg.file], Edit{
+				File: rg.file, Line: line, Before: before, After: after,
+			})
 		}
-		f := idx.Files[r.File]
-		if f == nil || r.Line <= 0 || r.Line > len(f.Lines) {
-			continue
-		}
-		before := f.Lines[r.Line-1]
-		after := rewriteLine(before, oldName, newName, r.IsLocal)
-		if after == before {
-			continue
-		}
-		editsByFile[r.File] = append(editsByFile[r.File], Edit{File: r.File, Line: r.Line, Before: before, After: after})
 	}
 
 	// 3. Doc rewrites (text-only, word-boundary). Only applied for global
@@ -309,6 +321,79 @@ func Apply(plan *Plan) error {
 	return nil
 }
 
+// scanRange is a 1-indexed inclusive line span in one indexed source file.
+type scanRange struct {
+	file  string
+	start int
+	end   int
+}
+
+// renameScanRanges chooses which source lines a rename may touch.
+//
+// Global unscoped renames scan every indexed file so matching ENDP/PUBLIC
+// lines and comment-only mentions are included. Local labels (and any
+// rename with InProc set) stay inside the relevant PROC, including its
+// header and ENDP line.
+func renameScanRanges(idx *index.Index, declSyms []*index.SymbolEntry, allLocal bool, inProc string) []scanRange {
+	if !allLocal && inProc == "" {
+		out := make([]scanRange, 0, len(idx.Files))
+		for path, f := range idx.Files {
+			if f == nil || len(f.Lines) == 0 {
+				continue
+			}
+			out = append(out, scanRange{file: path, start: 1, end: len(f.Lines)})
+		}
+		return out
+	}
+
+	procs := map[string]bool{}
+	if inProc != "" {
+		procs[inProc] = true
+	} else {
+		for _, s := range declSyms {
+			if s.EnclosingProc != "" {
+				procs[s.EnclosingProc] = true
+			}
+		}
+	}
+
+	out := make([]scanRange, 0, len(procs))
+	for name := range procs {
+		p := idx.Procs[name]
+		if p == nil {
+			continue
+		}
+		f := idx.Files[p.File]
+		end := p.EndLine
+		if f != nil && (end <= 0 || end > len(f.Lines)) {
+			end = len(f.Lines)
+		}
+		if p.StartLine <= 0 || end < p.StartLine {
+			continue
+		}
+		out = append(out, scanRange{file: p.File, start: p.StartLine, end: end})
+	}
+	if len(out) > 0 {
+		return out
+	}
+
+	// Local with no enclosing PROC recorded: fall back to the declaration
+	// files so the label line itself is still rewritten.
+	seen := map[string]bool{}
+	for _, s := range declSyms {
+		if inProc != "" && s.EnclosingProc != inProc {
+			continue
+		}
+		f := idx.Files[s.File]
+		if f == nil || seen[s.File] {
+			continue
+		}
+		seen[s.File] = true
+		out = append(out, scanRange{file: s.File, start: 1, end: len(f.Lines)})
+	}
+	return out
+}
+
 // validIdent checks that newName is a plausible JWasm identifier (letter or
 // underscore start, no spaces or punctuation). We don't enforce reserved-
 // word checks here; if the user picks `proc` they'll find out at the next
@@ -336,9 +421,11 @@ func validIdent(s string) bool {
 // with newName. When local is true, we look for `@@oldName`; otherwise we
 // require the surrounding chars not to be ident continuations.
 //
-// The implementation is byte-based for speed and predictability. We treat
-// `@` as ident-continuation only when paired (`@@`); other contexts treat
-// `@` as boundary.
+// Code string/character literals (`'Foo'` / `"Foo"`) are copied unchanged
+// so a data string that happens to match a symbol is not treated as a
+// reference. After a `;` comment starter that is not inside a literal,
+// quotes are ordinary text -- so "don't" in a comment does not hide the
+// rest of the line, and free-form `; see Foo` mentions are rewritten.
 func rewriteLine(line, oldName, newName string, local bool) string {
 	target := oldName
 	if local {
@@ -347,7 +434,28 @@ func rewriteLine(line, oldName, newName string, local bool) string {
 	var b strings.Builder
 	b.Grow(len(line))
 	i := 0
+	inComment := false
 	for i < len(line) {
+		if !inComment {
+			c := line[i]
+			if c == '\'' || c == '"' {
+				q := c
+				b.WriteByte(c)
+				i++
+				for i < len(line) && line[i] != q {
+					b.WriteByte(line[i])
+					i++
+				}
+				if i < len(line) {
+					b.WriteByte(line[i])
+					i++
+				}
+				continue
+			}
+			if c == ';' {
+				inComment = true
+			}
+		}
 		if !startsWith(line, i, target) {
 			b.WriteByte(line[i])
 			i++
@@ -372,7 +480,6 @@ func rewriteLine(line, oldName, newName string, local bool) string {
 			i++
 			continue
 		}
-		// All checks passed; emit replacement.
 		if local {
 			b.WriteString("@@")
 			b.WriteString(newName)

@@ -1,97 +1,153 @@
-// Package mcp wires the index query layer onto the MCP protocol surface.
-package mcp
+// Package tool implements asmtool's project queries and refactorings.
+package tool
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
-
-	"github.com/orlovsky/jwasm-mcp/internal/classify"
-	"github.com/orlovsky/jwasm-mcp/internal/config"
-	"github.com/orlovsky/jwasm-mcp/internal/index"
-	"github.com/orlovsky/jwasm-mcp/internal/rename"
-	"github.com/orlovsky/jwasm-mcp/internal/source"
+	"github.com/dmitryor/asmtool/internal/classify"
+	"github.com/dmitryor/asmtool/internal/config"
+	"github.com/dmitryor/asmtool/internal/index"
+	"github.com/dmitryor/asmtool/internal/rename"
 )
 
-// Server holds the live index plus mutable state to support reloads.
-type Server struct {
+// Tool holds a project index and the callback used after source mutations.
+type Tool struct {
 	cfg *config.Config
-	mu  sync.RWMutex
 	idx *index.Index
 	// rebuild, when non-nil, runs a full re-parse and jwasm rebuild and
-	// swaps the resulting index. Called synchronously by write tools
-	// (rename_symbol) so addresses survive across edits without waiting
-	// for the watcher's debounce window.
+	// swaps the resulting index so addresses survive source edits.
 	rebuild func() error
 }
 
-func New(cfg *config.Config, idx *index.Index) *Server {
-	return &Server{cfg: cfg, idx: idx}
+func New(cfg *config.Config, idx *index.Index) *Tool {
+	return &Tool{cfg: cfg, idx: idx}
 }
 
 // SetRebuild installs the rebuild callback. Pass nil to clear.
-func (s *Server) SetRebuild(fn func() error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Tool) SetRebuild(fn func() error) {
 	s.rebuild = fn
 }
 
-func (s *Server) rebuildFn() func() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Tool) rebuildFn() func() error {
 	return s.rebuild
 }
 
-func (s *Server) Index() *index.Index {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Tool) Index() *index.Index {
 	return s.idx
 }
 
-func (s *Server) SetIndex(idx *index.Index) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Tool) SetIndex(idx *index.Index) {
 	s.idx = idx
 }
 
-// Build returns a fully-wired MCP server backed by s. Caller can pass it to
-// server.ServeStdio for stdio transport.
-func (s *Server) Build() *server.MCPServer {
-	srv := server.NewMCPServer(
-		"jwasm-mcp",
-		"0.1.0",
-		server.WithToolCapabilities(false),
-	)
-	s.registerTools(srv)
-	return srv
-}
-
-// jsonText marshals v to indented JSON and wraps it as a text tool result.
-// All structured replies go through this so the agent always gets the same
-// JSON-shaped surface regardless of which tool produced the result.
-func jsonText(v any) *mcp.CallToolResult {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return mcp.NewToolResultError("internal: marshal: " + err.Error())
+// Invoke runs a named command and returns a JSON-serializable value.
+func (s *Tool) Invoke(ctx context.Context, name string, args map[string]any) (any, error) {
+	req := Request{args: args}
+	handlers := map[string]func(context.Context, Request) (*Result, error){
+		"which_proc":               s.handleWhichProc,
+		"read_proc":                s.handleReadProc,
+		"find_callers":             s.handleFindCallers,
+		"find_data_refs":           s.handleFindDataRefs,
+		"find_callees":             s.handleFindCallees,
+		"module_layout":            s.handleModuleLayout,
+		"addr_to_location":         s.handleAddrToLocation,
+		"find_symbol":              s.handleFindSymbol,
+		"function_context":         s.handleFunctionContext,
+		"rename_symbol":            s.handleRenameSymbol,
+		"scan_relocation_blockers": s.handleScanBlockers,
+		"data_refs_at":             s.handleDataRefsAt,
+		"smc_clusters":             s.handleSmcClusters,
+		"find_mirror_writes":       s.handleFindMirrorWrites,
+		"smc_var_info":             s.handleSmcVarInfo,
+		"unresolved":               s.handleUnresolved,
 	}
-	return mcp.NewToolResultText(string(b))
+	handler := handlers[name]
+	if handler == nil {
+		return nil, fmt.Errorf("unknown command %q", name)
+	}
+	result, err := handler(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if result.err != "" {
+		return nil, fmt.Errorf("%s", result.err)
+	}
+	return result.value, nil
 }
 
-func errResult(msg string) *mcp.CallToolResult {
-	return mcp.NewToolResultError(msg)
+type Result struct {
+	value any
+	err   string
+}
+
+func okResult(v any) *Result {
+	return &Result{value: v}
+}
+
+func errResult(msg string) *Result {
+	return &Result{err: msg}
+}
+
+// Request provides typed access to command arguments.
+type Request struct {
+	args map[string]any
+}
+
+func (r Request) RequireString(name string) (string, error) {
+	value, ok := r.args[name].(string)
+	if !ok || value == "" {
+		return "", fmt.Errorf("%q must be a non-empty string", name)
+	}
+	return value, nil
+}
+
+func (r Request) RequireFloat(name string) (float64, error) {
+	if _, ok := r.args[name]; !ok {
+		return 0, fmt.Errorf("%q is required", name)
+	}
+	return r.GetFloat(name, 0), nil
+}
+
+func (r Request) GetString(name, fallback string) string {
+	if value, ok := r.args[name].(string); ok {
+		return value
+	}
+	return fallback
+}
+
+func (r Request) GetBool(name string, fallback bool) bool {
+	if value, ok := r.args[name].(bool); ok {
+		return value
+	}
+	return fallback
+}
+
+func (r Request) GetFloat(name string, fallback float64) float64 {
+	value, ok := r.args[name]
+	if !ok {
+		return fallback
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return rv.Convert(reflect.TypeOf(float64(0))).Float()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(rv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return float64(rv.Uint())
+	}
+	return fallback
 }
 
 // resolveFile lets callers refer to files by basename ("render3d.inc") or
 // absolute path. Returns the absolute path used by the index.
-func (s *Server) resolveFile(name string) string {
+func (s *Tool) resolveFile(name string) string {
 	if filepath.IsAbs(name) {
 		return name
 	}
@@ -128,145 +184,9 @@ func parseAddrArg(s string) (uint32, error) {
 	return uint32(v), nil
 }
 
-// ----- Tool registration -----
+// ----- Command handlers -----
 
-func (s *Server) registerTools(srv *server.MCPServer) {
-	srv.AddTool(mcp.NewTool("which_proc",
-		mcp.WithDescription("Return the PROC enclosing a (file, line) location."),
-		mcp.WithString("file", mcp.Required(),
-			mcp.Description("Source file (basename like render3d.inc, or absolute path)")),
-		mcp.WithNumber("line", mcp.Required(),
-			mcp.Description("1-indexed source line number")),
-	), s.handleWhichProc)
-
-	srv.AddTool(mcp.NewTool("read_proc",
-		mcp.WithDescription("Return the full source of a PROC, from declaration through ENDP."),
-		mcp.WithString("name", mcp.Required(),
-			mcp.Description("PROC name")),
-	), s.handleReadProc)
-
-	srv.AddTool(mcp.NewTool("find_callers",
-		mcp.WithDescription("Return call/jmp references targeting the given symbol. When the name resolves to a global declaration (PROC/export/global/EQU), only non-@@ refs are returned. When the name only exists as a PROC-local label, only @@-refs are returned -- pass `in_proc` to scope to one PROC."),
-		mcp.WithString("name", mcp.Required()),
-		mcp.WithString("in_proc",
-			mcp.Description("Optional: enclosing PROC name (only relevant for local labels)")),
-	), s.handleFindCallers)
-
-	srv.AddTool(mcp.NewTool("find_data_refs",
-		mcp.WithDescription("Counterpart to find_callers for data symbols. Returns memory-operand, immediate, offset-keyword, and dw/db/dd references (every use that isn't a call/jmp). Use to understand how a data label or EQU is read/written -- the natural read tool when naming an unresolved data symbol. Output groups counts by `kind` and, for memory-operand refs, by `access` (`read`/`write`/`rw`) so writers and readers can be sorted without substring-matching `text`. When the queried name is an SMC anchor with no direct refs, the response includes an `aliases` list pointing to its EQU'd Var_* slots."),
-		mcp.WithString("name", mcp.Required()),
-		mcp.WithString("in_proc",
-			mcp.Description("Optional: enclosing PROC name (only relevant for local labels)")),
-	), s.handleFindDataRefs)
-
-	srv.AddTool(mcp.NewTool("find_callees",
-		mcp.WithDescription("Return distinct call/jmp targets from a PROC body, split into `external` (cross-PROC outgoing edges of the call graph -- what most queries want) and `internal` (`@@local` jumps that stay inside this PROC -- usually internal control flow noise). De-duplicated by (target, kind)."),
-		mcp.WithString("name", mcp.Required(),
-			mcp.Description("Containing PROC name")),
-	), s.handleFindCallees)
-
-	srv.AddTool(mcp.NewTool("module_layout",
-		mcp.WithDescription("List PROCs in a module file, sorted by start line, with addresses if known."),
-		mcp.WithString("file", mcp.Required()),
-	), s.handleModuleLayout)
-
-	srv.AddTool(mcp.NewTool("addr_to_location",
-		mcp.WithDescription("Map a CS offset to its enclosing PROC. Accepts hex (0xa17c, A17Ch) or decimal."),
-		mcp.WithString("addr", mcp.Required()),
-	), s.handleAddrToLocation)
-
-	srv.AddTool(mcp.NewTool("find_symbol",
-		mcp.WithDescription("Look up declarations of a symbol by name. Returns one entry per declaration site."),
-		mcp.WithString("name", mcp.Required()),
-	), s.handleFindSymbol)
-
-	srv.AddTool(mcp.NewTool("function_context",
-		mcp.WithDescription("Composite read for a PROC. Returns in one call: full body, every caller site (with N lines of surrounding code so you see what arguments/registers are set up), external callees (cross-PROC; internal @@-local jumps are counted but suppressed as noise), prev/next sibling PROCs in the same module, and the @@-local label list. Use this to name an unresolved scaffolding PROC without making 5+ separate read/grep calls."),
-		mcp.WithString("name", mcp.Required()),
-		mcp.WithNumber("caller_context_lines",
-			mcp.Description("Lines of surrounding code per call site (default 5; 0 to suppress)")),
-	), s.handleFunctionContext)
-
-	srv.AddTool(mcp.NewTool("rename_symbol",
-		mcp.WithDescription("Atomic, scope-aware rename of a JWasm symbol across the source tree. Word-boundary matching avoids substring hits; @@-local renames are confined to one PROC; collisions with existing names are refused. Pass dry_run=true to preview the edits without writing."),
-		mcp.WithString("old", mcp.Required(),
-			mcp.Description("Existing symbol name (without `@@` prefix; pass in_proc to scope locals)")),
-		mcp.WithString("new", mcp.Required(),
-			mcp.Description("New name (must be a valid JWasm identifier)")),
-		mcp.WithString("in_proc",
-			mcp.Description("For @@-local renames: the enclosing PROC. Required when old is only declared as a local label.")),
-		mcp.WithBoolean("dry_run",
-			mcp.Description("If true, return the edit list without writing (default: true; pass false to apply).")),
-		mcp.WithBoolean("include_docs",
-			mcp.Description("If true, also rewrite *.md files under doc_paths (global renames only). Default: false.")),
-		mcp.WithBoolean("allow_locals_across_procs",
-			mcp.Description("When old is a PROC-local label declared in many PROCs, this opt-in allows renaming every instance. Off by default to prevent accidental sweeping renames of common labels (Done/Loop/Ret).")),
-	), s.handleRenameSymbol)
-
-	srv.AddTool(mcp.NewTool("scan_relocation_blockers",
-		mcp.WithDescription("Scan the project for hardcoded literal addresses that would prevent moving the code. Returns confidence-tagged candidates: 'definite' (literal in [imm] memory operand matching a known label) needs no review; 'probable' (dw entries matching labels) needs spot-check; 'ambiguous' (mov reg, imm matching label) needs review."),
-		mcp.WithString("file",
-			mcp.Description("Optional: limit scan to a single source file (basename or absolute path)")),
-		mcp.WithString("confidence",
-			mcp.Description("Optional filter: 'definite', 'probable', or 'ambiguous' (default: all)")),
-		mcp.WithNumber("limit",
-			mcp.Description("Max entries to return (default 200)")),
-	), s.handleScanBlockers)
-
-	srv.AddTool(mcp.NewTool("data_refs_at",
-		mcp.WithDescription("Address-keyed counterpart to find_data_refs. Returns the union of memory-operand/imm/offset/dw/db/dd refs from every symbol whose declared address falls in [addr, addr+size). Closes the alias-overlap case where a byte EQU (e.g. Var_d5c8) lives at the same byte as a word label (VideoDetectResult): writes go through the word alias and don't show up under the byte symbol's refs. Output groups refs by the source symbol they were declared against, with access classification per ref."),
-		mcp.WithString("addr", mcp.Required(),
-			mcp.Description("Start address. Hex (0xa720, A720h) or decimal.")),
-		mcp.WithNumber("size",
-			mcp.Description("Byte range to cover (default 1 -- byte query)")),
-	), s.handleDataRefsAt)
-
-	srv.AddTool(mcp.NewTool("smc_clusters",
-		mcp.WithDescription("Group SMC anchors into clusters. Three grouping modes:\n  - by=\"proximity\" (default): anchors that share a source file AND lie within `max_gap` bytes of each other (default 16). Catches runs of 2-3 consecutive immediates patched together.\n  - by=\"writer_proc\" / \"reader_proc\": vars touched by the same PROC. Catches matrix-broadcast patterns where a single PROC reads or writes 4+ slots back-to-back even when they span ~150 source lines. Module-scope refs surface under the synthetic key `<file>:module-scope`.\n  - by=\"writer_file\" / \"reader_file\": coarser, file-keyed grouping. Right shape for module-scope setup blocks (e.g. polydraw.inc's 18 SMC slots all written at file scope without a PROC wrapper).\nEach cluster surfaces its members (anchor, var alias, slot info, host instruction). Proximity clusters also list the writer PROCs that touch any var in the cluster. Use proc/file-keyed clustering BEFORE per-var annotation: name the cluster's purpose first, then individual vars inherit the role."),
-		mcp.WithString("by",
-			mcp.Description("Cluster key: 'proximity' (default), 'writer_proc', 'reader_proc', 'writer_file', 'reader_file'")),
-		mcp.WithString("proc",
-			mcp.Description("With by=writer_proc/reader_proc: filter to one PROC name. For module-scope refs use '<basename>:module-scope'.")),
-		mcp.WithString("file",
-			mcp.Description("With by=proximity: limit anchor scan to a single source file. With by=writer_file/reader_file: limit cluster output to vars whose writers/readers live in that file.")),
-		mcp.WithNumber("max_gap",
-			mcp.Description("With by=proximity: max byte gap between consecutive anchors (default 16)")),
-		mcp.WithNumber("min_size",
-			mcp.Description("Minimum cluster size -- singletons are usually noise (default 2)")),
-		mcp.WithNumber("limit",
-			mcp.Description("Max clusters to return (default 50)")),
-		mcp.WithNumber("sub_max_line_gap",
-			mcp.Description("With by=writer_*/reader_*: gap (in source lines) below which adjacent writer/reader sites are sub-grouped. Default 25; 0 disables sub-clustering. Surfaces the 4-sub-cluster shape of e.g. perframe.inc (motion-delta broadcast, SP-anchor pair, LOD-scale group, timer pair) inside what would otherwise be a single 30-var blob.")),
-	), s.handleSmcClusters)
-
-	srv.AddTool(mcp.NewTool("find_mirror_writes",
-		mcp.WithDescription("For a writer PROC, return groups of consecutive memory-write refs whose SOURCE operand text is identical -- i.e. the PROC computed one value and broadcast it to N SMC slots back-to-back. Catches the ComputeViewMatrix pattern (one matrix element computed, stored to 3 mirror sites: vertex projection / face renderer / AaBb cull) without the agent having to scan source for triple-stores. Groups are ordered by the lowest source line in the group."),
-		mcp.WithString("proc", mcp.Required(),
-			mcp.Description("Writer PROC name (or '<basename>:module-scope' for module-scope writers)")),
-		mcp.WithNumber("max_line_gap",
-			mcp.Description("Max gap (in source lines) between consecutive writes to keep them in the same group. Default 5.")),
-		mcp.WithNumber("min_size",
-			mcp.Description("Minimum group size (default 2)")),
-	), s.handleFindMirrorWrites)
-
-	srv.AddTool(mcp.NewTool("smc_var_info",
-		mcp.WithDescription("Composite read for a self-modifying-code variable. Accepts either the Var_NNNN EQU alias or its SmcAnchor_NNNN host label, and returns the var's typed-pointer slot (size + byte offset), the anchor declaration with address, the host instruction's source line, and a writer/reader split derived from access classification of every memory-operand ref. Replaces the four-call dance (read globals.inc EQU + find_symbol(anchor) + Read host line + find_data_refs(var)) with one call -- the natural primitive for the SMC-annotation worklist."),
-		mcp.WithString("name", mcp.Required(),
-			mcp.Description("Var_NNNN alias or SmcAnchor_NNNN host label")),
-	), s.handleSmcVarInfo)
-
-	srv.AddTool(mcp.NewTool("unresolved",
-		mcp.WithDescription("Return symbols that still carry auto-generated scaffolding names (FUN_*, Lxxxx, WORD_1000_*, BYTE_1000_*, DAT_*, Var_<hex>) ranked by reference count -- the highest-leverage entries are the ones with most callers/uses. The natural worklist source for a 'name what's still unnamed' session: pick a high-rank entry, run function_context (PROC) or find_data_refs (data) to understand it, propose a name, then rename_symbol with dry_run=true to preview."),
-		mcp.WithString("kind",
-			mcp.Description("'procs' (default) for FUN_/Lxxxx PROCs, 'data' for WORD_/BYTE_/DAT_/Var_ data labels, 'all' for both")),
-		mcp.WithNumber("limit",
-			mcp.Description("Max entries to return (default 50)")),
-	), s.handleUnresolved)
-}
-
-// ----- Tool handlers -----
-
-func (s *Server) handleWhichProc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleWhichProc(ctx context.Context, req Request) (*Result, error) {
 	file, err := req.RequireString("file")
 	if err != nil {
 		return errResult("missing 'file': " + err.Error()), nil
@@ -278,7 +198,7 @@ func (s *Server) handleWhichProc(ctx context.Context, req mcp.CallToolRequest) (
 	abs := s.resolveFile(file)
 	idx := s.Index()
 	if _, ok := idx.Files[abs]; !ok {
-		return jsonText(map[string]any{
+		return okResult(map[string]any{
 			"found": false,
 			"file":  filepath.Base(abs),
 			"line":  int(line),
@@ -287,14 +207,14 @@ func (s *Server) handleWhichProc(ctx context.Context, req mcp.CallToolRequest) (
 	}
 	p := idx.WhichProc(abs, int(line))
 	if p == nil {
-		return jsonText(map[string]any{
+		return okResult(map[string]any{
 			"found": false,
 			"file":  filepath.Base(abs),
 			"line":  int(line),
 			"note":  "no PROC encloses this line (likely header comment, EQU declaration, or inline data between PROCs)",
 		}), nil
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"found":      true,
 		"name":       p.Name,
 		"file":       filepath.Base(p.File),
@@ -306,7 +226,7 @@ func (s *Server) handleWhichProc(ctx context.Context, req mcp.CallToolRequest) (
 	}), nil
 }
 
-func (s *Server) handleReadProc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleReadProc(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -317,7 +237,7 @@ func (s *Server) handleReadProc(ctx context.Context, req mcp.CallToolRequest) (*
 		return errResult(err.Error()), nil
 	}
 	p := idx.Procs[name]
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"name":       p.Name,
 		"file":       filepath.Base(p.File),
 		"start_line": p.StartLine,
@@ -328,7 +248,7 @@ func (s *Server) handleReadProc(ctx context.Context, req mcp.CallToolRequest) (*
 	}), nil
 }
 
-func (s *Server) handleFindCallers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFindCallers(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -338,21 +258,21 @@ func (s *Server) handleFindCallers(ctx context.Context, req mcp.CallToolRequest)
 	out := make([]map[string]any, 0, len(refs))
 	for _, r := range refs {
 		out = append(out, map[string]any{
-			"file":           filepath.Base(r.File),
-			"line":           r.Line,
-			"kind":           r.Kind,
-			"in_proc":        r.EnclosingProc,
-			"text":           r.Text,
+			"file":    filepath.Base(r.File),
+			"line":    r.Line,
+			"kind":    r.Kind,
+			"in_proc": r.EnclosingProc,
+			"text":    r.Text,
 		})
 	}
-	return jsonText(map[string]any{
-		"target":      name,
+	return okResult(map[string]any{
+		"target":       name,
 		"caller_count": len(out),
-		"callers":     out,
+		"callers":      out,
 	}), nil
 }
 
-func (s *Server) handleFindDataRefs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFindDataRefs(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -453,10 +373,10 @@ func (s *Server) handleFindDataRefs(ctx context.Context, req mcp.CallToolRequest
 			res["note"] = "no direct refs against this name -- writes/reads likely go through the listed aliases. Try smc_var_info(<alias>), find_data_refs(<alias>), or data_refs_at(<addr>, <size>) to union them."
 		}
 	}
-	return jsonText(res), nil
+	return okResult(res), nil
 }
 
-func (s *Server) handleFindCallees(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFindCallees(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -485,16 +405,16 @@ func (s *Server) handleFindCallees(ctx context.Context, req mcp.CallToolRequest)
 		}
 		return out
 	}
-	return jsonText(map[string]any{
-		"proc":            name,
-		"external":        mkList(external),
-		"external_count":  len(external),
-		"internal":        mkList(internal),
-		"internal_count":  len(internal),
+	return okResult(map[string]any{
+		"proc":           name,
+		"external":       mkList(external),
+		"external_count": len(external),
+		"internal":       mkList(internal),
+		"internal_count": len(internal),
 	}), nil
 }
 
-func (s *Server) handleModuleLayout(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleModuleLayout(ctx context.Context, req Request) (*Result, error) {
 	file, err := req.RequireString("file")
 	if err != nil {
 		return errResult("missing 'file': " + err.Error()), nil
@@ -530,10 +450,10 @@ func (s *Server) handleModuleLayout(ctx context.Context, req mcp.CallToolRequest
 			res["note"] = "no PROCs declared in this file (likely globals/EQU-only)"
 		}
 	}
-	return jsonText(res), nil
+	return okResult(res), nil
 }
 
-func (s *Server) handleAddrToLocation(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleAddrToLocation(ctx context.Context, req Request) (*Result, error) {
 	addrStr, err := req.RequireString("addr")
 	if err != nil {
 		return errResult("missing 'addr': " + err.Error()), nil
@@ -547,7 +467,7 @@ func (s *Server) handleAddrToLocation(ctx context.Context, req mcp.CallToolReque
 	if p == nil {
 		// Could be in globals_lo/_hi (above last PROC's end_addr) or simply
 		// outside CSEG. Surface that to the caller.
-		return jsonText(map[string]any{
+		return okResult(map[string]any{
 			"found": false,
 			"addr":  fmt.Sprintf("0x%04x", addr),
 			"note":  "no PROC encloses this address (likely globals_lo, DSEG, or outside CSEG)",
@@ -586,10 +506,10 @@ func (s *Server) handleAddrToLocation(ctx context.Context, req mcp.CallToolReque
 		}
 		res["smc_site"] = smc
 	}
-	return jsonText(res), nil
+	return okResult(res), nil
 }
 
-func (s *Server) handleFindSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFindSymbol(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -611,7 +531,7 @@ func (s *Server) handleFindSymbol(ctx context.Context, req mcp.CallToolRequest) 
 		}
 		out = append(out, entry)
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"name":         name,
 		"declarations": out,
 		"count":        len(out),
@@ -620,7 +540,7 @@ func (s *Server) handleFindSymbol(ctx context.Context, req mcp.CallToolRequest) 
 
 // isProcScaffolding tests for naming patterns that indicate an unresolved
 // PROC name: Ghidra-style FUN_*, Lxxxx where xxxx is hex (an unnamed branch
-// target later promoted to a PROC), or Lb<hex> variants observed in retal.
+// target later promoted to a PROC), or Lb<hex> variants.
 func isProcScaffolding(name string) bool {
 	switch {
 	case strings.HasPrefix(name, "FUN_"):
@@ -634,8 +554,8 @@ func isProcScaffolding(name string) bool {
 }
 
 // isDataScaffolding tests for naming patterns that indicate an unresolved
-// data label: Ghidra's WORD_/BYTE_/DAT_ exports, plus the Var_<hex> EQUates
-// commonly used as placeholder data symbols in this project.
+// data label: Ghidra's WORD_/BYTE_/DAT_ exports, plus Var_<hex> EQUates
+// commonly used as placeholder data symbols.
 func isDataScaffolding(name string) bool {
 	switch {
 	case strings.HasPrefix(name, "WORD_"):
@@ -664,7 +584,7 @@ func looksHexTail(s string) bool {
 	return true
 }
 
-func (s *Server) handleUnresolved(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleUnresolved(ctx context.Context, req Request) (*Result, error) {
 	limit := int(req.GetFloat("limit", 50))
 	if limit <= 0 {
 		limit = 50
@@ -763,7 +683,7 @@ func (s *Server) handleUnresolved(ctx context.Context, req mcp.CallToolRequest) 
 		}
 		out = append(out, entry)
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"total_unresolved": total,
 		"limit":            limit,
 		"kind":             kind,
@@ -771,7 +691,7 @@ func (s *Server) handleUnresolved(ctx context.Context, req mcp.CallToolRequest) 
 	}), nil
 }
 
-func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleRenameSymbol(ctx context.Context, req Request) (*Result, error) {
 	oldName, err := req.RequireString("old")
 	if err != nil {
 		return errResult("missing 'old': " + err.Error()), nil
@@ -815,77 +735,31 @@ func (s *Server) handleRenameSymbol(ctx context.Context, req mcp.CallToolRequest
 			}
 			out["note"] = hint
 		}
-		return jsonText(out), nil
+		return okResult(out), nil
 	}
 	if err := rename.Apply(plan); err != nil {
 		return errResult("apply: " + err.Error()), nil
 	}
-	// Trigger a full rebuild (jwasm + reparse + atomic swap) so addresses
-	// survive the rename. Falls back to a fast partial reparse (no listing)
-	// if no rebuild callback is registered -- that branch loses addresses
-	// until the next watcher fire, but never serves stale source.
-	rebuilt := false
-	if fn := s.rebuildFn(); fn != nil {
-		if err := fn(); err != nil {
-			return errResult("apply succeeded but rebuild failed: " + err.Error()), nil
-		}
-		rebuilt = true
-	} else {
-		touched := map[string]bool{}
-		for _, e := range plan.Edits {
-			if filepath.Ext(e.File) == ".inc" || filepath.Ext(e.File) == ".asm" {
-				touched[e.File] = true
-			}
-		}
-		var paths []string
-		for p := range touched {
-			paths = append(paths, p)
-		}
-		if files, err := rename.Reparse(idx, paths); err == nil {
-			s.replaceParsedFiles(files)
-		}
+	fn := s.rebuildFn()
+	if fn == nil {
+		return errResult("apply succeeded but no index rebuild callback is configured"), nil
 	}
-	return jsonText(map[string]any{
-		"applied":              true,
-		"old":                  plan.OldName,
-		"new":                  plan.NewName,
-		"is_local":             plan.IsLocal,
-		"in_proc":              plan.InProc,
-		"files_touched":        plan.FilesTouched,
-		"edit_count":           len(plan.Edits),
-		"index_fully_rebuilt":  rebuilt,
+	if err := fn(); err != nil {
+		return errResult("apply succeeded but index rebuild failed: " + err.Error()), nil
+	}
+	return okResult(map[string]any{
+		"applied":             true,
+		"old":                 plan.OldName,
+		"new":                 plan.NewName,
+		"is_local":            plan.IsLocal,
+		"in_proc":             plan.InProc,
+		"files_touched":       plan.FilesTouched,
+		"edit_count":          len(plan.Edits),
+		"index_fully_rebuilt": true,
 	}), nil
 }
 
-// replaceParsedFiles swaps the parsed Files entries for the given paths
-// and rebuilds the index. It does not re-run jwasm; symbol-table addresses
-// remain stale until the next full rebuild. Most queries (callers, body,
-// PROCs by name) are unaffected -- only address-bearing tools regress.
-func (s *Server) replaceParsedFiles(updated []*source.File) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur := s.idx
-	if cur == nil {
-		return
-	}
-	all := make([]*source.File, 0, len(cur.Files))
-	updatedByPath := map[string]*source.File{}
-	for _, f := range updated {
-		updatedByPath[f.Path] = f
-	}
-	for path, f := range cur.Files {
-		if u, ok := updatedByPath[path]; ok {
-			all = append(all, u)
-		} else {
-			all = append(all, f)
-		}
-	}
-	s.idx = index.Build(all, nil)
-	// Note: we lose addresses on this fast path. A subsequent full rebuild
-	// (via the watcher or restart) will restore them.
-}
-
-func (s *Server) handleScanBlockers(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleScanBlockers(ctx context.Context, req Request) (*Result, error) {
 	fileFilter := req.GetString("file", "")
 	confFilter := strings.ToLower(req.GetString("confidence", ""))
 	limit := int(req.GetFloat("limit", 200))
@@ -915,7 +789,7 @@ func (s *Server) handleScanBlockers(ctx context.Context, req mcp.CallToolRequest
 	for _, c := range filtered {
 		bucket[c.Confidence]++
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"total":      len(filtered),
 		"shown":      len(out),
 		"definite":   bucket[classify.DefiniteAddress],
@@ -928,7 +802,7 @@ func (s *Server) handleScanBlockers(ctx context.Context, req mcp.CallToolRequest
 // handleDataRefsAt unions data refs from every symbol whose address
 // falls inside [addr, addr+size). Resolves the byte-slot-inside-word case
 // where a write to the wide alias is invisible under the narrow alias.
-func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleDataRefsAt(ctx context.Context, req Request) (*Result, error) {
 	addrStr, err := req.RequireString("addr")
 	if err != nil {
 		return errResult("missing 'addr': " + err.Error()), nil
@@ -978,24 +852,24 @@ func (s *Server) handleDataRefsAt(ctx context.Context, req mcp.CallToolRequest) 
 		totalRefs += len(entries)
 	}
 	res := map[string]any{
-		"addr":       fmt.Sprintf("0x%04x", addr),
-		"size":       size,
-		"sym_count":  len(syms),
-		"ref_count":  totalRefs,
-		"by_access":  totalByAccess,
-		"symbols":    bySym,
+		"addr":      fmt.Sprintf("0x%04x", addr),
+		"size":      size,
+		"sym_count": len(syms),
+		"ref_count": totalRefs,
+		"by_access": totalByAccess,
+		"symbols":   bySym,
 	}
 	if len(syms) == 0 {
 		res["note"] = "no symbols declared in this byte range -- check the addr or pass a wider size"
 	}
-	return jsonText(res), nil
+	return okResult(res), nil
 }
 
 // handleFindMirrorWrites scans a writer PROC's mem-write refs and groups
 // consecutive runs whose source operand text is identical. Each group is
 // the broadcast of a single computed value to multiple SMC slots --
 // ComputeViewMatrix's 9-element-x-3-mirror pattern is the canonical case.
-func (s *Server) handleFindMirrorWrites(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFindMirrorWrites(ctx context.Context, req Request) (*Result, error) {
 	proc, err := req.RequireString("proc")
 	if err != nil {
 		return errResult("missing 'proc': " + err.Error()), nil
@@ -1029,7 +903,7 @@ func (s *Server) handleFindMirrorWrites(ctx context.Context, req mcp.CallToolReq
 			"writes":     writes,
 		})
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"proc":   proc,
 		"groups": out,
 		"count":  len(out),
@@ -1039,7 +913,7 @@ func (s *Server) handleFindMirrorWrites(ctx context.Context, req mcp.CallToolReq
 // handleSmcClusters returns SMC anchors grouped either by spatial proximity
 // or by shared writer/reader PROC. See Index.SmcClusters and
 // Index.SmcClustersByProc for the two grouping heuristics.
-func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleSmcClusters(ctx context.Context, req Request) (*Result, error) {
 	by := strings.ToLower(req.GetString("by", "proximity"))
 	procFilter := req.GetString("proc", "")
 	fileFilter := req.GetString("file", "")
@@ -1152,7 +1026,7 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 			}
 			out = append(out, entry)
 		}
-		return jsonText(map[string]any{
+		return okResult(map[string]any{
 			"by":       by,
 			"role":     role,
 			"total":    total,
@@ -1214,7 +1088,7 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 		}
 		out = append(out, entry)
 	}
-	return jsonText(map[string]any{
+	return okResult(map[string]any{
 		"total":    total,
 		"shown":    len(out),
 		"max_gap":  maxGap,
@@ -1227,7 +1101,7 @@ func (s *Server) handleSmcClusters(ctx context.Context, req mcp.CallToolRequest)
 // code slot and returns the host instruction plus a writer/reader split.
 // Accepts either side of the pair: a Var_NNNN EQU alias or the SmcAnchor_NNNN
 // label it points at.
-func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleSmcVarInfo(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -1459,12 +1333,12 @@ func (s *Server) handleSmcVarInfo(ctx context.Context, req mcp.CallToolRequest) 
 		res["other_refs"] = other
 		res["other_ref_count"] = len(other)
 	}
-	return jsonText(res), nil
+	return okResult(res), nil
 }
 
 // handleFunctionContext is wired by the dedicated context package.
 // Implemented in context_handler.go to keep this file focused.
-func (s *Server) handleFunctionContext(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Tool) handleFunctionContext(ctx context.Context, req Request) (*Result, error) {
 	name, err := req.RequireString("name")
 	if err != nil {
 		return errResult("missing 'name': " + err.Error()), nil
@@ -1478,5 +1352,5 @@ func (s *Server) handleFunctionContext(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return errResult(err.Error()), nil
 	}
-	return jsonText(out), nil
+	return okResult(out), nil
 }
