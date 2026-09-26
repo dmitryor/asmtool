@@ -102,6 +102,11 @@ type Options struct {
 
 // PlanRename builds an Edit list without touching disk.
 func PlanRename(idx *index.Index, oldName, newName string, opts Options) (*Plan, error) {
+	// A PROC-local label may be named with or without its `@@`; the plan
+	// works on the bare name the index keys it by.
+	atLabel := strings.HasPrefix(oldName, "@@") || strings.HasPrefix(newName, "@@")
+	oldName = index.BareLocalName(oldName)
+	newName = index.BareLocalName(newName)
 	if oldName == newName {
 		return nil, fmt.Errorf("rename: old and new are identical")
 	}
@@ -125,6 +130,10 @@ func PlanRename(idx *index.Index, oldName, newName string, opts Options) (*Plan,
 			hasGlobalDecl = true
 			allLocal = false
 		}
+	}
+
+	if atLabel && !allLocal {
+		return nil, fmt.Errorf("rename: %q is not a PROC-local label, so neither name takes `@@`", oldName)
 	}
 
 	// Safety: if the symbol is purely local AND declared in multiple PROCs,
@@ -435,7 +444,27 @@ func rewriteLine(line, oldName, newName string, local bool) string {
 	b.Grow(len(line))
 	i := 0
 	inComment := false
+	// shift is how far the code so far has moved right. The next padded gap
+	// (two or more spaces before more text, typically the `; addr bytes`
+	// comment) absorbs it, down to one space, so aligned columns stay put.
+	shift := 0
 	for i < len(line) {
+		if shift != 0 && !inComment && line[i] == ' ' {
+			j := i
+			for j < len(line) && line[j] == ' ' {
+				j++
+			}
+			if run := j - i; run >= 2 && j < len(line) {
+				pad := run - shift
+				if pad < 1 {
+					pad = 1
+				}
+				b.WriteString(strings.Repeat(" ", pad))
+				shift = 0
+				i = j
+				continue
+			}
+		}
 		if !inComment {
 			c := line[i]
 			if c == '\'' || c == '"' {
@@ -487,6 +516,9 @@ func rewriteLine(line, oldName, newName string, local bool) string {
 			b.WriteString(newName)
 		}
 		i = end
+		if !inComment {
+			shift += len(newName) - len(oldName)
+		}
 	}
 	return b.String()
 }

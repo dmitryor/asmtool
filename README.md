@@ -65,6 +65,10 @@ Batch files are JSON arrays of independent renames:
 Preview with `asmtool rename-batch renames.json`; add `--apply` to write all
 combined edits and rebuild the index once.
 
+A PROC-local label may be named with or without its `@@` (`Done` or `@@Done`)
+in every command; the index keys locals by the bare name. A global cannot be
+renamed to an `@@` name.
+
 ## Index cache
 
 The cache is content-addressed under the configured `cache_dir`
