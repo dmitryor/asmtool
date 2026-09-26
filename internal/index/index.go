@@ -267,11 +267,18 @@ func (idx *Index) SymbolsCoveringRange(start, end uint32) []*SymbolEntry {
 	return out
 }
 
+// BareLocalName strips the `@@` prefix of a PROC-local label. The index keys
+// locals by their bare name, since `@@` marks scope rather than spelling, so
+// "@@Done" and "Done" name the same local and every lookup accepts both.
+func BareLocalName(name string) string {
+	return strings.TrimPrefix(name, "@@")
+}
+
 // FindSymbol returns all declarations of the given name.
 func (idx *Index) FindSymbol(name string) []*SymbolEntry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	out := idx.Symbols[name]
+	out := idx.Symbols[BareLocalName(name)]
 	dup := make([]*SymbolEntry, len(out))
 	copy(dup, out)
 	return dup
@@ -281,7 +288,7 @@ func (idx *Index) FindSymbol(name string) []*SymbolEntry {
 func (idx *Index) FindRefs(name string) []*RefEntry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	out := idx.Refs[name]
+	out := idx.Refs[BareLocalName(name)]
 	dup := make([]*RefEntry, len(out))
 	copy(dup, out)
 	return dup

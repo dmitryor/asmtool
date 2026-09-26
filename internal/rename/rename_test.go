@@ -125,7 +125,7 @@ Other ENDP
 		{"        db      'Foo'          ; tagged Foo", "        db      'Foo'          ; tagged FooImage"},
 		{"Foo ENDP", "FooImage ENDP"},
 		{"PUBLIC  Foo, FooMasked", "PUBLIC  FooImage, FooMasked"},
-		{"        call    Foo            ; dispatch to Foo", "        call    FooImage            ; dispatch to FooImage"},
+		{"        call    Foo            ; dispatch to Foo", "        call    FooImage       ; dispatch to FooImage"},
 	}
 	for _, w := range want {
 		if got[w.before] != w.after {
@@ -230,4 +230,76 @@ func planFrom(t *testing.T, src, old, new string, opts ...planOpt) *Plan {
 		t.Fatalf("PlanRename: %v", err)
 	}
 	return plan
+}
+
+func TestPlanRenameAcceptsAtAtLocalNames(t *testing.T) {
+	src := `Outer PROC NEAR
+        je      @@Done
+@@Done:
+        ret
+Outer ENDP
+`
+	plan := planFrom(t, src, "@@Done", "@@Finished", func(o *Options) { o.InProc = "Outer" })
+	if !plan.IsLocal || plan.OldName != "Done" || plan.NewName != "Finished" {
+		t.Fatalf("plan = local %v, %q -> %q", plan.IsLocal, plan.OldName, plan.NewName)
+	}
+	found := map[string]bool{}
+	for _, e := range plan.Edits {
+		found[strings.TrimSpace(e.After)] = true
+	}
+	if !found["je      @@Finished"] || !found["@@Finished:"] {
+		t.Errorf("edits = %+v", plan.Edits)
+	}
+}
+
+func TestPlanRenameRefusesAtAtForGlobal(t *testing.T) {
+	src := `Foo PROC NEAR
+        ret
+Foo ENDP
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.inc")
+	if err := os.WriteFile(path, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := source.ParseFile(path)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	idx := index.Build([]*source.File{f}, nil)
+	if _, err := PlanRename(idx, "Foo", "@@Bar", Options{}); err == nil ||
+		!strings.Contains(err.Error(), "not a PROC-local label") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRewriteLineKeepsPaddedColumns(t *testing.T) {
+	cases := []struct {
+		in, old, new, want string
+	}{
+		// Shorter name: the padding grows and the comment column stays.
+		{"        call    LongName_Old   ; 70c2  e8 39 ec", "LongName_Old", "Short",
+			"        call    Short          ; 70c2  e8 39 ec"},
+		{"nested_lo_ground       EQU 7ch", "nested_lo_ground", "nested_ground",
+			"nested_ground          EQU 7ch"},
+		// Longer name: the padding shrinks, but never below one space.
+		{"        call    Foo  ; x", "Foo", "FooImageLonger", "        call    FooImageLonger ; x"},
+		// One space is a separator, not alignment.
+		{"        call    Foo ; x", "Foo", "FooImage", "        call    FooImage ; x"},
+		// Inside a comment the spacing is prose and stays.
+		{"        nop     ; Foo   bar", "Foo", "FooImage", "        nop     ; FooImage   bar"},
+		// The next padded gap absorbs the change even past other operands.
+		{"        mov     byte ptr ds:[Foo], al           ; c71d  a2 4f f0", "Foo", "FooLonger",
+			"        mov     byte ptr ds:[FooLonger], al     ; c71d  a2 4f f0"},
+		// Two renames on a line add up; a quoted string is not a gap.
+		{"        db      Foo, 'a    b', Foo    ; x", "Foo", "Fo",
+			"        db      Fo, 'a    b', Fo      ; x"},
+		// Nothing after the padding: trailing spaces are left alone.
+		{"        call    Foo   ", "Foo", "FooImage", "        call    FooImage   "},
+	}
+	for _, c := range cases {
+		if got := rewriteLine(c.in, c.old, c.new, false); got != c.want {
+			t.Errorf("%q: %s -> %s\n  got  %q\n  want %q", c.in, c.old, c.new, got, c.want)
+		}
+	}
 }
